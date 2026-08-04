@@ -56,6 +56,7 @@ STAGE_COUPON_SETTINGS_WAITING_COMMENT = "coupon_settings_waiting_comment"
 STAGE_ADD_GIFT_WAITING_ID = "add_gift_waiting_id"
 STAGE_ADD_GIFT_WAITING_EMOJI = "add_gift_waiting_emoji"
 STAGE_ADD_GIFT_WAITING_PRICE = "add_gift_waiting_price"
+STAGE_REMOVE_GIFT_WAITING_ID = "remove_gift_waiting_id"
 
 GIFTS: list = []          # كتالوج الهدايا المحمّل في الذاكرة
 GIFTS_PATH: str = ""      # مسار ملف gift.json داخل الفوليوم
@@ -96,6 +97,35 @@ def reload_gifts() -> int:
 
 def find_gift(local_id: int) -> Optional[dict]:
     return next((g for g in GIFTS if g["id"] == local_id), None)
+
+
+def remove_gift_by_id(gift_id: int) -> bool:
+    resolved_path = _resolve_gifts_path(GIFTS_PATH)
+    try:
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            gifts = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        gifts = []
+
+    original_len = len(gifts)
+    gifts = [
+        g
+        for g in gifts
+        if not (
+            g.get("id") == gift_id
+            or g.get("gift_id") == gift_id
+            or g.get("gift_id") == str(gift_id)
+        )
+    ]
+
+    if len(gifts) == original_len:
+        return False
+
+    with open(resolved_path, "w", encoding="utf-8") as f:
+        json.dump(gifts, f, ensure_ascii=False, indent=2)
+
+    reload_gifts()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +201,10 @@ def build_start_keyboard() -> types.InlineKeyboardMarkup:
 def build_coupons_menu_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("➕ أضف قسيمة", callback_data="coupons:add", style="primary"))
-    markup.row(types.InlineKeyboardButton("🎁 إضافة هدية", callback_data="coupons:add_gift", style="primary"))
+    markup.row(
+        types.InlineKeyboardButton("🎁 إضافة هدية", callback_data="coupons:add_gift", style="primary"),
+        types.InlineKeyboardButton("🗑 إزالة هدية", callback_data="coupons:remove_gift", style="danger"),
+    )
     markup.row(types.InlineKeyboardButton("➖ إزالة قسيمة", callback_data="coupons:remove", style="danger"))
     markup.row(types.InlineKeyboardButton("⚙️ الإعدادات", callback_data="coupons:settings", style="primary"))
     markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="coupons:back", style="danger"))
@@ -762,7 +795,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
             parse_mode="Markdown",
         )
 
-    # --- إزالة قسيمة --------------------------------------------------------
+    # --- إضافة/إزالة هدية ---------------------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "coupons:add_gift")
     @owner_only_callback
     async def cb_coupons_add_gift(call):
@@ -773,6 +806,21 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
         }
         await bot.edit_message_text(
             "أرسل معرف الهدية (gift_id) الذي تريد إضافته:",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+        )
+        await bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda call: call.data == "coupons:remove_gift")
+    @owner_only_callback
+    async def cb_coupons_remove_gift(call):
+        user_id = call.from_user.id
+        SESSIONS[user_id] = {
+            "stage": STAGE_REMOVE_GIFT_WAITING_ID,
+            "message_id": call.message.message_id,
+        }
+        await bot.edit_message_text(
+            "أرسل معرف الهدية (gift_id) الذي تريد إزالته:",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
@@ -888,6 +936,45 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
             f"✅ تم إضافة الهدية بنجاح:\nالمعرف: {gift_id}\nالسعر: {price}\nالإيموجي: {emoji}",
             reply_markup=build_coupons_menu_keyboard(),
         )
+
+    @bot.message_handler(
+        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_REMOVE_GIFT_WAITING_ID,
+        content_types=["text"],
+    )
+    @owner_only_message
+    async def handle_remove_gift_id(message):
+        user_id = message.from_user.id
+        session = SESSIONS[user_id]
+        try:
+            gift_id = int(message.text.strip())
+        except ValueError:
+            await bot.reply_to(message, "❌ أدخل معرفاً رقميًا صحيحًا.")
+            return
+
+        removed = remove_gift_by_id(gift_id)
+
+        try:
+            await bot.delete_message(message.chat.id, session.get("message_id"))
+        except Exception:
+            pass
+        try:
+            await bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+        clear_session(user_id)
+
+        if removed:
+            await bot.send_message(
+                message.chat.id,
+                f"✅ تم حذف الهدية بنجاح:\nالمعرف: {gift_id}",
+                reply_markup=build_coupons_menu_keyboard(),
+            )
+        else:
+            await bot.send_message(
+                message.chat.id,
+                f"❌ لم يتم العثور على هدية بهذا المعرف: {gift_id}",
+                reply_markup=build_coupons_menu_keyboard(),
+            )
 
     @bot.callback_query_handler(func=lambda call: call.data == "coupons:remove")
     @owner_only_callback
