@@ -1,0 +1,2 @@
+pyTelegramBotAPI==4.36.0
+telethon==1.44.0
