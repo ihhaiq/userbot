@@ -26,6 +26,16 @@
       ],
       "created_at": 1785859682.2703972,
       "ttl_minutes": 300
+    },
+    "دب": {
+      "code": "دب",
+      "gift_id": 1,
+      "hide_name": false,
+      "comment_text": "👍 وردة",
+      "max_uses": 9,
+      "used_by": [],
+      "created_at": 1788683304.966756,
+      "ttl_minutes": 900
     }
   }
 }

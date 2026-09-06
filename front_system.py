@@ -2,7 +2,7 @@
 front_system.py
 ================
 الواجهة الأمامية: بوت تيليجرام عادي (AsyncTeleBot) مقيّد بالكامل على
-OWNER_ID فقط — أي رسالة أو زر من أي حساب آخر يُرفض برسالة "غير مرخّص".
+OWNER_IDS فقط — أي رسالة أو زر من حساب غير موجود بالقائمة يُرفض برسالة "غير مرخّص".
 
 يعرض كتالوج الهدايا، يطلب تحديد المستلم (لنفسي / لغيري)، يجمع الإعدادات
 (إخفاء الاسم + تعليق)، ثم يمرر كل شيء إلى backend_system لتنفيذ عملية
@@ -23,7 +23,9 @@ OWNER_ID فقط — أي رسالة أو زر من أي حساب آخر يُرف
 import json
 import logging
 import os
-import time
+import re
+
+import aiohttp
 from typing import Optional
 
 from telebot import types
@@ -31,7 +33,6 @@ from telebot.async_telebot import AsyncTeleBot
 from telethon import events
 
 import backend_system
-import coupon_system
 from backend_system import GiftErrorCode
 
 logger = logging.getLogger(__name__)
@@ -48,19 +49,11 @@ STAGE_CHOOSING_HIDE = "choosing_hide"
 STAGE_WAITING_COMMENT = "waiting_comment"
 STAGE_CONFIRMING = "confirming"
 
-# مراحل تدفق "القسائم" (لوحة المطوّر)
-STAGE_COUPON_WAITING_CODE = "coupon_waiting_code"
-STAGE_COUPON_WAITING_MAX_USES = "coupon_waiting_max_uses"
-STAGE_COUPON_WAITING_TTL = "coupon_waiting_ttl"
-STAGE_COUPON_SETTINGS_WAITING_COMMENT = "coupon_settings_waiting_comment"
-STAGE_ADD_GIFT_WAITING_ID = "add_gift_waiting_id"
-STAGE_ADD_GIFT_WAITING_EMOJI = "add_gift_waiting_emoji"
-STAGE_ADD_GIFT_WAITING_PRICE = "add_gift_waiting_price"
-STAGE_REMOVE_GIFT_WAITING_ID = "remove_gift_waiting_id"
+STAGE_ADD_GIFT_WAITING_DATA = "add_gift_waiting_data"
 
 GIFTS: list = []          # كتالوج الهدايا المحمّل في الذاكرة
 GIFTS_PATH: str = ""      # مسار ملف gift.json داخل الفوليوم
-OWNER_ID: int = 0
+OWNER_IDS: set[int] = set()
 TG_CLIENT = None          # كائن TelegramClient (Telethon) الخاص بالحساب المضيف
 
 
@@ -128,6 +121,205 @@ def remove_gift_by_id(gift_id: int) -> bool:
     return True
 
 
+def _save_gifts(gifts: list) -> None:
+    resolved_path = _resolve_gifts_path(GIFTS_PATH)
+    with open(resolved_path, "w", encoding="utf-8") as f:
+        json.dump(gifts, f, ensure_ascii=False, indent=2)
+    reload_gifts()
+
+
+def _next_local_gift_id(gifts: list) -> int:
+    """معرف داخلي صغير للأزرار، منفصل عن gift_id الحقيقي في Telegram."""
+    ids = []
+    for gift in gifts:
+        try:
+            ids.append(int(gift.get("id")))
+        except (TypeError, ValueError):
+            continue
+    return max(ids, default=0) + 1
+
+
+def _slice_utf16(text: str, offset: int, length: int) -> str:
+    """Bot API يحسب entity offsets بوحدات UTF-16، لذلك لا نستخدم slicing العادي."""
+    raw = text.encode("utf-16-le")
+    start = max(0, int(offset)) * 2
+    end = start + max(0, int(length)) * 2
+    try:
+        return raw[start:end].decode("utf-16-le").strip()
+    except UnicodeDecodeError:
+        return ""
+
+
+def _extract_single_custom_emoji(message) -> tuple[Optional[str], Optional[str]]:
+    """يرجع (custom_emoji_id, fallback_emoji_text) إذا الرسالة تحتوي Custom Emoji واحد فقط."""
+    found = []
+    text = getattr(message, "text", None) or ""
+    for entity in (getattr(message, "entities", None) or []):
+        if getattr(entity, "type", None) != "custom_emoji":
+            continue
+        custom_id = getattr(entity, "custom_emoji_id", None)
+        if not custom_id:
+            continue
+        fallback = _slice_utf16(text, entity.offset, entity.length)
+        found.append((str(custom_id), fallback))
+
+    if len(found) != 1:
+        return None, None
+    return found[0]
+
+
+def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
+    """
+    يقبل رسالة واحدة فيها gift_id + Custom Emoji + السعر.
+
+    الصيغة المفضلة:
+        <custom emoji> 50⭐️— 5974210632977745012
+
+    ويقبل أيضاً الصيغ المرنة القديمة.
+    """
+    text = (getattr(message, "text", None) or "").strip()
+    if not text:
+        return None, "❌ أرسل البيانات كنص يحتوي الآيدي والإيموجي البريميوم والسعر."
+
+    custom_emoji_id, emoji_text = _extract_single_custom_emoji(message)
+    if not custom_emoji_id:
+        return None, "❌ الرسالة لازم تحتوي إيموجي بريميوم (Custom Emoji) واحد بالضبط."
+
+    # الصيغة الأساسية: <emoji> 50⭐️— `5974210632977745012`
+    # Markdown مثل **...** و `...` يصل للنص كأرقام عادية مع Entities منفصلة.
+    exact_price_match = re.search(r"(\d+)\s*⭐(?:️)?", text)
+    exact_id_match = re.search(r"(?:—|–|-)\s*`?\s*(\d{10,})\s*`?\s*$", text)
+
+    id_match = re.search(
+        r"(?:gift[_\s-]*id|id|الآيدي|الايدي|المعرف)\s*[:=\-]?\s*(\d{10,})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    price_match = re.search(
+        r"(?:price|prix|السعر)\s*[:=\-]?\s*(\d+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    gift_id = int(exact_id_match.group(1)) if exact_id_match else (int(id_match.group(1)) if id_match else None)
+    price = int(exact_price_match.group(1)) if exact_price_match else (int(price_match.group(1)) if price_match else None)
+
+    # صيغة مختصرة بدون عناوين: أول رقم طويل = gift_id وآخر رقم آخر = السعر.
+    numbers = [int(value) for value in re.findall(r"\d+", text)]
+    if gift_id is None:
+        gift_id = next((value for value in numbers if value >= 10**9), None)
+
+    if price is None:
+        remaining = [value for value in numbers if value != gift_id]
+        if remaining:
+            price = remaining[-1]
+
+    if gift_id is None:
+        return None, "❌ ما قدرت أحدد gift_id. أرسله كرقم طويل داخل الرسالة."
+    if price is None or price <= 0:
+        return None, "❌ ما قدرت أحدد السعر. لازم يكون رقماً أكبر من صفر."
+
+    return {
+        "gift_id": str(gift_id),
+        "custom_emoji_id": custom_emoji_id,
+        "emoji": emoji_text or "🎁",
+        "price": price,
+    }, None
+
+
+def upsert_gift(gift_data: dict) -> str:
+    """يضيف هدية جديدة أو يحدث نفس gift_id إذا كان موجوداً، ويرجع added/updated."""
+    resolved_path = _resolve_gifts_path(GIFTS_PATH)
+    try:
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            gifts = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        gifts = []
+
+    existing = next(
+        (gift for gift in gifts if str(gift.get("gift_id")) == str(gift_data["gift_id"])),
+        None,
+    )
+
+    if existing is None:
+        gifts.append({
+            "id": _next_local_gift_id(gifts),
+            "gift_id": str(gift_data["gift_id"]),
+            "custum_gift_icon": str(gift_data["custom_emoji_id"]),
+            "emoji": gift_data.get("emoji") or "🎁",
+            "prix": int(gift_data["price"]),
+        })
+        action = "added"
+    else:
+        existing["gift_id"] = str(gift_data["gift_id"])
+        existing["custum_gift_icon"] = str(gift_data["custom_emoji_id"])
+        existing.pop("custom_gift_icon", None)
+        existing["emoji"] = gift_data.get("emoji") or existing.get("emoji") or "🎁"
+        existing["prix"] = int(gift_data["price"])
+        action = "updated"
+
+    _save_gifts(gifts)
+    return action
+
+
+def get_auto_gift() -> Optional[dict]:
+    """يرجع الهدية المحددة كهدية تلقائية، أو None إذا لم يتم تحديد واحدة."""
+    return next((gift for gift in GIFTS if gift.get("auto") is True), None)
+
+
+def set_auto_gift(local_id: int) -> bool:
+    """يحدد هدية واحدة فقط كهدية تلقائية ويحفظ الاختيار داخل gifts.json."""
+    resolved_path = _resolve_gifts_path(GIFTS_PATH)
+    try:
+        with open(resolved_path, "r", encoding="utf-8") as f:
+            gifts = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+    found = False
+    for gift in gifts:
+        is_target = gift.get("id") == local_id
+        if is_target:
+            found = True
+            gift["auto"] = True
+        else:
+            gift.pop("auto", None)
+
+    if not found:
+        return False
+
+    _save_gifts(gifts)
+    return True
+
+
+def _normalize_emoji(value: str) -> str:
+    """يطبع الإيموجي بصيغة ثابتة للمقارنة (يتجاهل variation selectors والمسافات)."""
+    return (value or "").replace("\ufe0f", "").replace("\ufe0e", "").strip()
+
+
+def find_gift_by_emoji(value: str) -> Optional[dict]:
+    wanted = _normalize_emoji(value)
+    if not wanted:
+        return None
+    return next(
+        (gift for gift in GIFTS if _normalize_emoji(str(gift.get("emoji") or "")) == wanted),
+        None,
+    )
+
+
+def find_gift_by_custom_emoji_id(document_id: int) -> Optional[dict]:
+    wanted = str(document_id)
+    return next(
+        (
+            gift
+            for gift in GIFTS
+            if str(gift.get("custum_gift_icon") or "") == wanted
+            or str(gift.get("custom_gift_icon") or "") == wanted
+        ),
+        None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # بناء لوحات الأزرار
 # ---------------------------------------------------------------------------
@@ -136,12 +328,15 @@ def build_gifts_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
     row = []
     for item in GIFTS:
+        has_custom_icon = bool(item.get("custum_gift_icon"))
+        normal_emoji = item.get("emoji") or ""
+        button_text = f"{item['prix']}" if has_custom_icon else f"{normal_emoji} {item['prix']}".strip()
         btn_kwargs = dict(
-            text=f"{item['prix']}",
+            text=button_text,
             callback_data=f"g:{item['id']}",
             style="primary",
         )
-        if item.get("custum_gift_icon"):
+        if has_custom_icon:
             btn_kwargs["icon_custom_emoji_id"] = item["custum_gift_icon"]
         row.append(types.InlineKeyboardButton(**btn_kwargs))
         if len(row) == 2:
@@ -191,95 +386,210 @@ def build_confirm_keyboard() -> types.InlineKeyboardMarkup:
 def build_start_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("🎁 خذ هدية", callback_data="take_gift", style="primary"))
-    markup.row(types.InlineKeyboardButton("🎟 القسائم", callback_data="coupons:menu", style="primary"))
+    markup.row(types.InlineKeyboardButton("⚙️ إدارة الهدايا", callback_data="gifts:menu", style="primary"))
     return markup
 
 
-# ---------------------------------------------------------------------------
-# لوحات "القسائم" (لوحة المطوّر)
-# ---------------------------------------------------------------------------
-def build_coupons_menu_keyboard() -> types.InlineKeyboardMarkup:
+def build_gift_management_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup()
-    markup.row(types.InlineKeyboardButton("➕ أضف قسيمة", callback_data="coupons:add", style="primary"))
     markup.row(
-        types.InlineKeyboardButton("🎁 إضافة هدية", callback_data="coupons:add_gift", style="primary"),
-        types.InlineKeyboardButton("🗑 إزالة هدية", callback_data="coupons:remove_gift", style="danger"),
+        types.InlineKeyboardButton("🎁 إضافة/تحديث هدية", callback_data="gifts:add", style="primary"),
+        types.InlineKeyboardButton("⭐ هدية تلقائية", callback_data="gifts:auto", style="primary"),
     )
-    markup.row(types.InlineKeyboardButton("➖ إزالة قسيمة", callback_data="coupons:remove", style="danger"))
-    markup.row(types.InlineKeyboardButton("⚙️ الإعدادات", callback_data="coupons:settings", style="primary"))
-    markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="coupons:back", style="danger"))
+    markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="gifts:back", style="danger"))
     return markup
 
 
-def build_remove_coupon_keyboard() -> types.InlineKeyboardMarkup:
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for c in coupon_system.list_coupons():
-        markup.row(
-            types.InlineKeyboardButton(
-                f"🗑 {c['code']}", callback_data=f"coupons:rm:{c['code']}", style="danger"
-            )
-        )
-    markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="coupons:remove_back", style="danger"))
+def build_add_gifts_keyboard() -> types.InlineKeyboardMarkup:
+    """لوحة جلسة إضافة عدة هدايا؛ الجلسة لا تنتهي إلا بضغط «إنهاء»."""
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("✅ إنهاء", callback_data="gifts:add:finish", style="success")
+    )
     return markup
 
 
-def build_coupon_settings_keyboard() -> types.InlineKeyboardMarkup:
-    settings = coupon_system.get_settings()
-    gift = find_gift(settings["gift_id"]) if settings.get("gift_id") else None
-    gift_txt = f"{gift['prix']} ⭐" if gift else "غير محدَّدة ⚠️"
-    hide_txt = "نعم" if settings.get("hide_name") else "لا"
-    comment_txt = settings.get("comment_text") or "بدون تعليق"
+def format_add_gifts_prompt(added: int = 0, updated: int = 0, last_notice: Optional[str] = None) -> str:
+    processed = added + updated
+    lines = [
+        "🎁 أرسل أو حوّل رسائل الهدايا واحدة بعد الأخرى.",
+        "",
+        "الصيغة:",
+        "🧸 50⭐️— `5974210632977745012`",
+        "",
+        "• 🧸 لازم يكون Premium / Custom Emoji",
+        "• 50 هو السعر بالنجوم",
+        "• الرقم الأخير هو gift_id",
+        "• نفس gift_id يُحدَّث بدل ما يتكرر",
+        "",
+        f"تمت معالجة: {processed} هدية",
+        f"• مضافة: {added}",
+        f"• محدثة: {updated}",
+    ]
+    if last_notice:
+        lines.extend(["", last_notice])
+    lines.extend(["", "بعد ما تخلص اضغط ✅ إنهاء."])
+    return "\n".join(lines)
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.row(types.InlineKeyboardButton(f"🎁 الهدية: {gift_txt}", callback_data="coupons:settings:gift", style="primary"))
-    markup.row(types.InlineKeyboardButton(f"🙈 إخفاء الاسم: {hide_txt}", callback_data="coupons:settings:hide", style="primary"))
-    markup.row(types.InlineKeyboardButton(f"💬 التعليق: {comment_txt}", callback_data="coupons:settings:comment", style="primary"))
-    markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="coupons:menu", style="danger"))
-    return markup
+
+def _gift_rich_emoji(gift: dict):
+    custom_id = gift.get("custum_gift_icon") or gift.get("custom_gift_icon")
+    if custom_id:
+        return {
+            "type": "custom_emoji",
+            "custom_emoji_id": str(custom_id),
+            "alternative_text": str(gift.get("emoji") or "🎁"),
+        }
+    return str(gift.get("emoji") or "🎁")
 
 
-def build_gift_pick_keyboard(callback_prefix: str, back_callback: str) -> types.InlineKeyboardMarkup:
+def build_gift_management_rich_message(notice: Optional[str] = None) -> dict:
+    """يبني شاشة إدارة الهدايا كـ Rich Message مع زر إزالة داخل كل صف."""
+    blocks = []
+    if notice:
+        blocks.append({"type": "paragraph", "text": notice})
+
+    blocks.append({"type": "heading", "text": "⚙️ إدارة الهدايا", "size": 3})
+
+    auto_gift = get_auto_gift()
+    if auto_gift:
+        blocks.append({
+            "type": "paragraph",
+            "text": [
+                "الهدية التلقائية: ",
+                _gift_rich_emoji(auto_gift),
+                f"  {auto_gift.get('prix', 0)}⭐",
+            ],
+        })
+    else:
+        blocks.append({"type": "paragraph", "text": "الهدية التلقائية: غير محددة"})
+
+    if GIFTS:
+        cells = [[
+            {"text": "إزالة", "is_header": True, "align": "center", "valign": "middle"},
+            {"text": "الهدية", "is_header": True, "align": "center", "valign": "middle"},
+            {"text": "الآيدي", "is_header": True, "align": "center", "valign": "middle"},
+        ]]
+
+        for gift in GIFTS:
+            local_id = int(gift["id"])
+            cells.append([
+                {
+                    "text": {
+                        "type": "button",
+                        "button": {
+                            "text": "إزالة",
+                            "style": "danger",
+                            "callback_data": f"gifts:remove:{local_id}",
+                        },
+                    },
+                    "align": "center",
+                    "valign": "middle",
+                },
+                {
+                    "text": _gift_rich_emoji(gift),
+                    "align": "center",
+                    "valign": "middle",
+                },
+                {
+                    "text": {
+                        "type": "code",
+                        "text": str(gift.get("gift_id") or "—"),
+                    },
+                    "align": "center",
+                    "valign": "middle",
+                },
+            ])
+
+        blocks.append({
+            "type": "table",
+            "cells": cells,
+            "is_bordered": True,
+            "is_striped": True,
+            "is_compact": True,
+            "caption": f"الهدايا الموجودة: {len(GIFTS)}",
+        })
+    else:
+        blocks.append({"type": "paragraph", "text": "لا توجد هدايا مضافة حالياً."})
+
+    return {"blocks": blocks, "is_rtl": True}
+
+
+async def _bot_api_json(bot: AsyncTeleBot, method: str, payload: dict):
+    """استدعاء Bot API مباشر للميزات الأحدث من نسخة pyTelegramBotAPI المثبتة."""
+    url = f"https://api.telegram.org/bot{bot.token}/{method}"
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, json=payload) as response:
+            data = await response.json(content_type=None)
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {data.get('description') or data}")
+    return data.get("result")
+
+
+async def edit_gift_management_message(
+    bot: AsyncTeleBot,
+    chat_id: int,
+    message_id: int,
+    notice: Optional[str] = None,
+) -> None:
+    await _bot_api_json(
+        bot,
+        "editMessageText",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "rich_message": build_gift_management_rich_message(notice),
+            "reply_markup": build_gift_management_keyboard().to_dict(),
+        },
+    )
+
+
+async def send_gift_management_message(
+    bot: AsyncTeleBot,
+    chat_id: int,
+    notice: Optional[str] = None,
+) -> None:
+    await _bot_api_json(
+        bot,
+        "sendRichMessage",
+        {
+            "chat_id": chat_id,
+            "rich_message": build_gift_management_rich_message(notice),
+            "reply_markup": build_gift_management_keyboard().to_dict(),
+        },
+    )
+
+
+def build_auto_gift_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
+    current = get_auto_gift()
+    current_id = current.get("id") if current else None
     row = []
     for item in GIFTS:
-        emoji = item.get("emoji") or item.get("icon") or "🎁"
-        row.append(
-            types.InlineKeyboardButton(
-                f"{emoji} {item['prix']} ⭐",
-                callback_data=f"{callback_prefix}:{item['id']}",
-                style="primary",
-            )
-        )
+        has_custom_icon = bool(item.get("custum_gift_icon"))
+        emoji = item.get("emoji") or ("" if has_custom_icon else "🎁")
+        prefix = "✅ " if item.get("id") == current_id else ""
+        btn_kwargs = {
+            "text": f"{prefix}{emoji} {item['prix']}⭐".strip(),
+            "callback_data": f"gifts:auto:set:{item['id']}",
+            "style": "success" if item.get("id") == current_id else "primary",
+        }
+        if has_custom_icon:
+            btn_kwargs["icon_custom_emoji_id"] = item["custum_gift_icon"]
+        row.append(types.InlineKeyboardButton(**btn_kwargs))
         if len(row) == 2:
             markup.row(*row)
             row = []
     if row:
         markup.row(*row)
-    markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data=back_callback, style="danger"))
+    markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="gifts:auto:back", style="danger"))
     return markup
 
 
-def format_coupons_list() -> str:
-    coupons = coupon_system.list_coupons()
-    if not coupons:
-        return "🎟 القسائم\n\nلا توجد قسائم حالياً."
-
-    now = time.time()
-    lines = ["🎟 القسائم المتوفرة:\n"]
-    for c in coupons:
-        gift = find_gift(c["gift_id"])
-        gift_txt = f"{gift['prix']} ⭐" if gift else "—"
-        remaining_uses = max(0, c["max_uses"] - len(c["used_by"]))
-        remaining_minutes = max(0.0, c["ttl_minutes"] - (now - c["created_at"]) / 60)
-        status = "✅ فعّالة" if coupon_system.is_active(c) else "⛔️ منتهية"
-
-        lines.append(
-            f"• `{c['code']}` — {status}\n"
-            f"  الهدية: {gift_txt}\n"
-            f"  الاستخدامات المتبقية: {remaining_uses}/{c['max_uses']}\n"
-            f"  الوقت المتبقي: {int(remaining_minutes)} دقيقة\n"
-        )
-    return "\n".join(lines)
+def get_quick_send_gift() -> Optional[dict]:
+    """يرجع الهدية التلقائية المحددة من لوحة إدارة الهدايا."""
+    return get_auto_gift()
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +638,14 @@ def _error_message(code) -> str:
 
 
 # ---------------------------------------------------------------------------
-# قيود الوصول — البوت مقيّد بالكامل على OWNER_ID فقط
+# قيود الوصول — البوت مقيّد بالكامل على OWNER_IDS
 # ---------------------------------------------------------------------------
 UNAUTHORIZED_TEXT = "🚫 لست مرخصاً لاستخدام هذا البوت."
 
 
 def owner_only_message(func):
     async def wrapped(message, *args, **kwargs):
-        if message.from_user is None or message.from_user.id != OWNER_ID:
+        if message.from_user is None or message.from_user.id not in OWNER_IDS:
             await _bot_ref.reply_to(message, UNAUTHORIZED_TEXT)
             return
         return await func(message, *args, **kwargs)
@@ -344,7 +654,7 @@ def owner_only_message(func):
 
 def owner_only_callback(func):
     async def wrapped(call, *args, **kwargs):
-        if call.from_user is None or call.from_user.id != OWNER_ID:
+        if call.from_user is None or call.from_user.id not in OWNER_IDS:
             await _bot_ref.answer_callback_query(call.id, UNAUTHORIZED_TEXT, show_alert=True)
             return
         return await func(call, *args, **kwargs)
@@ -357,14 +667,13 @@ _bot_ref: Optional[AsyncTeleBot] = None  # مرجع للبوت تستخدمه ا
 # ---------------------------------------------------------------------------
 # التسجيل الرئيسي — يُستدعى من main.py
 # ---------------------------------------------------------------------------
-def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, coupons_path: str) -> None:
-    global GIFTS_PATH, OWNER_ID, TG_CLIENT, _bot_ref
+def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> None:
+    global GIFTS_PATH, OWNER_IDS, TG_CLIENT, _bot_ref
     GIFTS_PATH = _resolve_gifts_path(gifts_path)
-    OWNER_ID = owner_id
+    OWNER_IDS = {int(user_id) for user_id in owner_ids}
     TG_CLIENT = telethon_client
     _bot_ref = bot
     reload_gifts()
-    coupon_system.init(coupons_path)
 
     # --- /start -------------------------------------------------------
     @bot.message_handler(commands=["start"])
@@ -383,6 +692,44 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
     async def cmd_rgift(message):
         count = reload_gifts()
         await bot.send_message(message.chat.id, f"تم تحديث كتالوج الهدايا ({count} هدية).")
+
+    # --- هدية @username -------------------------------------------------
+    @bot.message_handler(
+        func=lambda message: (
+            getattr(message.chat, "type", None) == "private"
+            and isinstance(getattr(message, "text", None), str)
+            and (message.text.strip() == "هدية" or message.text.strip().startswith("هدية "))
+        ),
+        content_types=["text"],
+    )
+    @owner_only_message
+    async def cmd_gift_to_user(message):
+        parts = message.text.strip().split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].strip():
+            await bot.reply_to(message, "الاستخدام: هدية @username")
+            return
+
+        raw_target = parts[1].strip()
+        resolved = await backend_system.resolve_user(TG_CLIENT, raw_target)
+        if resolved is None:
+            await bot.reply_to(message, "❌ لم يتم العثور على هذا المستخدم.")
+            return
+
+        user_id = message.from_user.id
+        clear_session(user_id)
+        sent = await bot.send_message(
+            message.chat.id,
+            f"اختر الهدية التي تريد إرسالها إلى {raw_target}:",
+            reply_markup=build_gifts_keyboard(),
+        )
+        SESSIONS[user_id] = {
+            "stage": STAGE_CHOOSING_GIFT,
+            "message_id": sent.message_id,
+            "target_mode": "other",
+            "target_value": resolved.id,
+            "target_display": raw_target,
+            "target_locked": True,
+        }
 
     # --- بدء التدفق ------------------------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "take_gift")
@@ -421,13 +768,22 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
             return
 
         session["gift"] = gift
-        session["stage"] = STAGE_CHOOSING_TARGET
-        await bot.edit_message_text(
-            "لمن هذه الهدية؟",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_target_keyboard(),
-        )
+        if session.get("target_locked"):
+            session["stage"] = STAGE_CHOOSING_HIDE
+            await bot.edit_message_text(
+                "هل تريد إخفاء اسمك عن المستلم؟",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=build_hide_name_keyboard(),
+            )
+        else:
+            session["stage"] = STAGE_CHOOSING_TARGET
+            await bot.edit_message_text(
+                "لمن هذه الهدية؟",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=build_target_keyboard(),
+            )
         await bot.answer_callback_query(call.id)
 
     # --- اختيار المستلم: لنفسي / لغيري -------------------------------------
@@ -645,27 +1001,22 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
         clear_session(user_id)
 
     # =====================================================================
-    # القسائم (لوحة المطوّر)
+    # إدارة كتالوج الهدايا
     # =====================================================================
-
-    # --- فتح لوحة القسائم -------------------------------------------------
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:menu")
+    @bot.callback_query_handler(func=lambda call: call.data == "gifts:menu")
     @owner_only_callback
-    async def cb_coupons_menu(call):
+    async def cb_gifts_menu(call):
         clear_session(call.from_user.id)
-        await bot.edit_message_text(
-            format_coupons_list(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupons_menu_keyboard(),
-            parse_mode="Markdown",
+        await edit_gift_management_message(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
         )
         await bot.answer_callback_query(call.id)
 
-    # --- الرجوع من لوحة القسائم إلى الشاشة الرئيسية ------------------------
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:back")
+    @bot.callback_query_handler(func=lambda call: call.data == "gifts:back")
     @owner_only_callback
-    async def cb_coupons_back(call):
+    async def cb_gifts_back(call):
         clear_session(call.from_user.id)
         await bot.edit_message_text(
             "أهلاً بك! اضغط الزر أدناه للحصول على هدية.",
@@ -675,531 +1026,267 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_id: int, co
         )
         await bot.answer_callback_query(call.id)
 
-    # --- إضافة قسيمة: طلب عدد الاستخدامات ثم مدة الصلاحية -------------------
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:add")
+    # --- تحديد الهدية التلقائية ---------------------------------------------
+    @bot.callback_query_handler(func=lambda call: call.data == "gifts:auto")
     @owner_only_callback
-    async def cb_coupons_add(call):
-        settings = coupon_system.get_settings()
-        if not settings.get("gift_id"):
-            await bot.answer_callback_query(
-                call.id, "⚠️ حدّد الهدية من الإعدادات أولاً.", show_alert=True
-            )
+    async def cb_gifts_auto(call):
+        if not GIFTS:
+            await bot.answer_callback_query(call.id, "لا توجد هدايا في الكتالوج.", show_alert=True)
             return
-
-        user_id = call.from_user.id
-        SESSIONS[user_id] = {
-            "stage": STAGE_COUPON_WAITING_CODE,
-            "message_id": call.message.message_id,
-        }
         await bot.edit_message_text(
-            "أرسل كود القسيمة الذي تريد اختياره (مثال: العراق أو ABC123):",
+            "⭐ اختر الهدية التي تريد إرسالها عند كتابة «ارسال» بدون إيموجي:",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
+            reply_markup=build_auto_gift_keyboard(),
         )
         await bot.answer_callback_query(call.id)
 
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_COUPON_WAITING_CODE,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_coupon_code(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-
-        code = message.text.strip()
-        if not code:
-            await bot.reply_to(message, "❌ أدخل كوداً صالحاً للقسيمة.")
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("gifts:auto:set:"))
+    @owner_only_callback
+    async def cb_gifts_auto_set(call):
+        try:
+            local_id = int(call.data.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            await bot.answer_callback_query(call.id, "معرف الهدية غير صالح.", show_alert=True)
             return
 
-        session["code"] = code.upper()
-        session["stage"] = STAGE_COUPON_WAITING_MAX_USES
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
-
-        sent = await bot.send_message(message.chat.id, "أرسل عدد الاستخدامات المسموحة للقسيمة (رقم صحيح، مثال: 20):")
-        session["message_id"] = sent.message_id
-
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_COUPON_WAITING_MAX_USES,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_coupon_max_uses(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-
-        try:
-            max_uses = int(message.text.strip())
-            if max_uses <= 0:
-                raise ValueError
-        except ValueError:
-            await bot.reply_to(message, "❌ أرسل رقماً صحيحاً أكبر من صفر.")
+        gift = find_gift(local_id)
+        if gift is None or not set_auto_gift(local_id):
+            await bot.answer_callback_query(call.id, "لم يتم العثور على الهدية.", show_alert=True)
             return
 
-        session["max_uses"] = max_uses
-        session["stage"] = STAGE_COUPON_WAITING_TTL
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
-
-        sent = await bot.send_message(message.chat.id, "أرسل مدة صلاحية القسيمة بالدقائق (رقم صحيح، مثال: 15):")
-        session["message_id"] = sent.message_id
-
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_COUPON_WAITING_TTL,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_coupon_ttl(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-
-        try:
-            ttl_minutes = int(message.text.strip())
-            if ttl_minutes <= 0:
-                raise ValueError
-        except ValueError:
-            await bot.reply_to(message, "❌ أرسل رقماً صحيحاً أكبر من صفر.")
-            return
-
-        coupon = coupon_system.create_coupon(session["code"], session["max_uses"], ttl_minutes)
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
-        clear_session(user_id)
-
-        await bot.send_message(
-            message.chat.id,
-            f"✅ تم إنشاء القسيمة: `{coupon['code']}`\n\n" + format_coupons_list(),
-            reply_markup=build_coupons_menu_keyboard(),
-            parse_mode="Markdown",
+        gift = find_gift(local_id) or gift
+        await bot.edit_message_text(
+            f"✅ تم تحديد {gift.get('emoji') or '🎁'} ({gift['prix']}⭐) كهدية تلقائية.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=build_auto_gift_keyboard(),
         )
+        await bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda call: call.data == "gifts:auto:back")
+    @owner_only_callback
+    async def cb_gifts_auto_back(call):
+        await edit_gift_management_message(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+        )
+        await bot.answer_callback_query(call.id)
 
     # --- إضافة/إزالة هدية ---------------------------------------------------
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:add_gift")
+    @bot.callback_query_handler(func=lambda call: call.data == "gifts:add")
     @owner_only_callback
-    async def cb_coupons_add_gift(call):
+    async def cb_gifts_add(call):
         user_id = call.from_user.id
         SESSIONS[user_id] = {
-            "stage": STAGE_ADD_GIFT_WAITING_ID,
+            "stage": STAGE_ADD_GIFT_WAITING_DATA,
             "message_id": call.message.message_id,
+            "chat_id": call.message.chat.id,
+            "added_count": 0,
+            "updated_count": 0,
         }
         await bot.edit_message_text(
-            "أرسل معرف الهدية (gift_id) الذي تريد إضافته:",
+            format_add_gifts_prompt(),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
+            reply_markup=build_add_gifts_keyboard(),
         )
         await bot.answer_callback_query(call.id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:remove_gift")
+    @bot.callback_query_handler(func=lambda call: call.data == "gifts:add:finish")
     @owner_only_callback
-    async def cb_coupons_remove_gift(call):
+    async def cb_gifts_add_finish(call):
         user_id = call.from_user.id
-        SESSIONS[user_id] = {
-            "stage": STAGE_REMOVE_GIFT_WAITING_ID,
-            "message_id": call.message.message_id,
-        }
-        await bot.edit_message_text(
-            "أرسل معرف الهدية (gift_id) الذي تريد إزالته:",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_ADD_GIFT_WAITING_ID,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_add_gift_id(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-        try:
-            gift_id = int(message.text.strip())
-        except ValueError:
-            await bot.reply_to(message, "❌ أدخل معرفاً رقميًا صحيحًا.")
+        session = SESSIONS.get(user_id)
+        if not session or session.get("stage") != STAGE_ADD_GIFT_WAITING_DATA:
+            await bot.answer_callback_query(call.id, "جلسة الإضافة منتهية بالفعل.")
             return
 
-        session["gift_id"] = gift_id
-        session["stage"] = STAGE_ADD_GIFT_WAITING_EMOJI
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
-
-        sent = await bot.send_message(message.chat.id, "أرسل إيموجي الهدية (مثال: 🎁 أو ❤️):")
-        session["message_id"] = sent.message_id
-
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_ADD_GIFT_WAITING_EMOJI,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_add_gift_emoji(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-        emoji = message.text.strip()
-        if not emoji:
-            await bot.reply_to(message, "❌ أدخل إيموجي صحيح.")
-            return
-
-        session["emoji"] = emoji
-        session["stage"] = STAGE_ADD_GIFT_WAITING_PRICE
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
-
-        sent = await bot.send_message(message.chat.id, "أرسل سعر الهدية (رقم صحيح):")
-        session["message_id"] = sent.message_id
-
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_ADD_GIFT_WAITING_PRICE,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_add_gift_price(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-        try:
-            price = int(message.text.strip())
-            if price <= 0:
-                raise ValueError
-        except ValueError:
-            await bot.reply_to(message, "❌ أدخل سعرًا صحيحًا أكبر من صفر.")
-            return
-
-        gift_id = session["gift_id"]
-        emoji = session["emoji"]
-        new_gift = {
-            "id": gift_id,
-            "gift_id": str(gift_id),
-            "custum_gift_icon": str(gift_id),
-            "prix": price,
-            "emoji": emoji,
-        }
-
-        try:
-            with open(GIFTS_PATH, "r", encoding="utf-8") as f:
-                gifts = json.load(f)
-        except FileNotFoundError:
-            gifts = []
-
-        gifts.append(new_gift)
-        with open(GIFTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(gifts, f, ensure_ascii=False, indent=2)
-
-        reload_gifts()
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
+        added = int(session.get("added_count", 0))
+        updated = int(session.get("updated_count", 0))
         clear_session(user_id)
 
-        await bot.send_message(
-            message.chat.id,
-            f"✅ تم إضافة الهدية بنجاح:\nالمعرف: {gift_id}\nالسعر: {price}\nالإيموجي: {emoji}",
-            reply_markup=build_coupons_menu_keyboard(),
+        await edit_gift_management_message(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            notice=f"✅ انتهت الإضافة — {added} مضافة، {updated} محدثة.",
         )
+        await bot.answer_callback_query(call.id, "تم إنهاء إضافة الهدايا")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("gifts:remove:"))
+    @owner_only_callback
+    async def cb_gifts_remove_row(call):
+        try:
+            local_id = int(call.data.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            await bot.answer_callback_query(call.id, "معرف الهدية غير صالح.", show_alert=True)
+            return
+
+        gift = find_gift(local_id)
+        if gift is None:
+            await bot.answer_callback_query(call.id, "هذه الهدية لم تعد موجودة.", show_alert=True)
+            return
+
+        if not remove_gift_by_id(local_id):
+            await bot.answer_callback_query(call.id, "تعذر حذف الهدية.", show_alert=True)
+            return
+
+        await edit_gift_management_message(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
+            notice="✅ تم حذف الهدية.",
+        )
+        await bot.answer_callback_query(call.id, "تم حذف الهدية")
 
     @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_REMOVE_GIFT_WAITING_ID,
+        func=lambda message: (
+            SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_ADD_GIFT_WAITING_DATA
+            and SESSIONS.get(message.from_user.id, {}).get("chat_id") == message.chat.id
+        ),
         content_types=["text"],
     )
     @owner_only_message
-    async def handle_remove_gift_id(message):
+    async def handle_add_gift_data(message):
         user_id = message.from_user.id
         session = SESSIONS[user_id]
-        try:
-            gift_id = int(message.text.strip())
-        except ValueError:
-            await bot.reply_to(message, "❌ أدخل معرفاً رقميًا صحيحًا.")
+        gift_data, error = parse_gift_input(message)
+
+        if error:
+            try:
+                await bot.edit_message_text(
+                    format_add_gifts_prompt(
+                        int(session.get("added_count", 0)),
+                        int(session.get("updated_count", 0)),
+                        last_notice=error + " جرّب الرسالة التالية.",
+                    ),
+                    chat_id=message.chat.id,
+                    message_id=session["message_id"],
+                    reply_markup=build_add_gifts_keyboard(),
+                )
+            except Exception:
+                await bot.reply_to(
+                    message,
+                    error + "\n\nمثال: 🧸 50⭐️— `5974210632977745012`",
+                )
             return
 
-        removed = remove_gift_by_id(gift_id)
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
-        try:
-            await bot.delete_message(message.chat.id, message.message_id)
-        except Exception:
-            pass
-        clear_session(user_id)
-
-        if removed:
-            await bot.send_message(
-                message.chat.id,
-                f"✅ تم حذف الهدية بنجاح:\nالمعرف: {gift_id}",
-                reply_markup=build_coupons_menu_keyboard(),
-            )
+        action = upsert_gift(gift_data)
+        if action == "added":
+            session["added_count"] = int(session.get("added_count", 0)) + 1
+            verb = "إضافة"
         else:
-            await bot.send_message(
-                message.chat.id,
-                f"❌ لم يتم العثور على هدية بهذا المعرف: {gift_id}",
-                reply_markup=build_coupons_menu_keyboard(),
-            )
+            session["updated_count"] = int(session.get("updated_count", 0)) + 1
+            verb = "تحديث"
 
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:remove")
-    @owner_only_callback
-    async def cb_coupons_remove(call):
-        if not coupon_system.list_coupons():
-            await bot.answer_callback_query(call.id, "لا توجد قسائم لإزالتها.", show_alert=True)
-            return
-        await bot.edit_message_text(
-            "اختر القسيمة التي تريد إزالتها:",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_remove_coupon_keyboard(),
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:remove_back")
-    @owner_only_callback
-    async def cb_coupons_remove_back(call):
-        await bot.edit_message_text(
-            format_coupons_list(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupons_menu_keyboard(),
-            parse_mode="Markdown",
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("coupons:rm:"))
-    @owner_only_callback
-    async def cb_coupons_rm(call):
-        code = call.data.split(":", 2)[2]
-        coupon_system.remove_coupon(code)
-        await bot.edit_message_text(
-            format_coupons_list(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupons_menu_keyboard(),
-            parse_mode="Markdown",
-        )
-        await bot.answer_callback_query(call.id, "🗑 تم حذف القسيمة.")
-
-    # --- إعدادات القسائم -----------------------------------------------------
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:settings")
-    @owner_only_callback
-    async def cb_coupons_settings(call):
-        clear_session(call.from_user.id)
-        await bot.edit_message_text(
-            "⚙️ إعدادات القسائم\n\nتُطبَّق هذه الإعدادات على كل قسيمة جديدة تُنشئها من الآن.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupon_settings_keyboard(),
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:settings:gift")
-    @owner_only_callback
-    async def cb_coupons_settings_gift(call):
-        await bot.edit_message_text(
-            "اختر الهدية التي تُرسَل تلقائياً عبر القسائم:",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_gift_pick_keyboard("coupons:settings:gift", "coupons:settings"),
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("coupons:settings:gift:"))
-    @owner_only_callback
-    async def cb_coupons_settings_gift_pick(call):
-        local_id = int(call.data.rsplit(":", 1)[1])
-        coupon_system.set_setting("gift_id", local_id)
-        await bot.edit_message_text(
-            "⚙️ إعدادات القسائم\n\nتُطبَّق هذه الإعدادات على كل قسيمة جديدة تُنشئها من الآن.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupon_settings_keyboard(),
-        )
-        await bot.answer_callback_query(call.id, "✅ تم تحديد الهدية.")
-
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:settings:hide")
-    @owner_only_callback
-    async def cb_coupons_settings_hide(call):
-        settings = coupon_system.get_settings()
-        coupon_system.set_setting("hide_name", not settings.get("hide_name", False))
-        await bot.edit_message_text(
-            "⚙️ إعدادات القسائم\n\nتُطبَّق هذه الإعدادات على كل قسيمة جديدة تُنشئها من الآن.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupon_settings_keyboard(),
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:settings:comment")
-    @owner_only_callback
-    async def cb_coupons_settings_comment(call):
-        user_id = call.from_user.id
-        SESSIONS[user_id] = {
-            "stage": STAGE_COUPON_SETTINGS_WAITING_COMMENT,
-            "message_id": call.message.message_id,
-        }
-        markup = types.InlineKeyboardMarkup()
-        markup.row(
-            types.InlineKeyboardButton(
-                "🚫 بدون تعليق", callback_data="coupons:settings:comment:none", style="danger"
-            )
-        )
-        await bot.edit_message_text(
-            "أرسل نص التعليق الذي يُرفق مع كل هدية تُرسَل عبر القسائم، أو اضغط الزر أدناه لإلغائه:",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=markup,
-        )
-        await bot.answer_callback_query(call.id)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "coupons:settings:comment:none")
-    @owner_only_callback
-    async def cb_coupons_settings_comment_none(call):
-        clear_session(call.from_user.id)
-        coupon_system.set_setting("comment_text", None)
-        await bot.edit_message_text(
-            "⚙️ إعدادات القسائم\n\nتُطبَّق هذه الإعدادات على كل قسيمة جديدة تُنشئها من الآن.",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_coupon_settings_keyboard(),
-        )
-        await bot.answer_callback_query(call.id, "🚫 تم إلغاء التعليق.")
-
-    @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage")
-        == STAGE_COUPON_SETTINGS_WAITING_COMMENT,
-        content_types=["text"],
-    )
-    @owner_only_message
-    async def handle_coupon_settings_comment(message):
-        user_id = message.from_user.id
-        session = SESSIONS[user_id]
-        comment_text = getattr(message, "text", None) or ""
-        if not comment_text:
-            comment_text = getattr(message, "caption", None) or ""
-
-        coupon_system.set_setting("comment_text", comment_text)
-
-        try:
-            await bot.delete_message(message.chat.id, session.get("message_id"))
-        except Exception:
-            pass
         try:
             await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
-        clear_session(user_id)
 
-        await bot.send_message(
-            message.chat.id,
-            "⚙️ إعدادات القسائم\n\nتُطبَّق هذه الإعدادات على كل قسيمة جديدة تُنشئها من الآن.",
-            reply_markup=build_coupon_settings_keyboard(),
+        await bot.edit_message_text(
+            format_add_gifts_prompt(
+                int(session.get("added_count", 0)),
+                int(session.get("updated_count", 0)),
+                last_notice=f"✅ تم {verb} الهدية — {gift_data['price']}⭐",
+            ),
+            chat_id=message.chat.id,
+            message_id=session["message_id"],
+            reply_markup=build_add_gifts_keyboard(),
         )
+
+
 
     # =====================================================================
-    # مستمع الرسائل الخاصة على حساب اليوزربوت نفسه — هنا يُطبَّق استخدام
-    # القسيمة: أي شخص يرسل كود قسيمة صالح في محادثة خاصة إلى الحساب
-    # المضيف يستلم الهدية المرتبطة بها تلقائياً (استخدام واحد لكل شخص).
+    # أمر «ارسال» من حساب اليوزربوت داخل أي محادثة خاصة.
+    # - «ارسال»             -> الهدية التلقائية المحددة من إدارة الهدايا.
+    # - «ارسال 🎁»          -> يطابق الإيموجي النصي المحفوظ مع الهدية.
+    # - «ارسال <custom>»    -> يدعم أيضاً Custom Emoji عبر document_id.
+    # يحذف رسالة الأمر قبل تنفيذ الإرسال حتى لا تظهر للطرف الآخر.
     # =====================================================================
     _me_cache = {"id": None}
 
-    @telethon_client.on(events.NewMessage(incoming=True))
-    async def on_private_message(event):
-        if not event.is_private:
+    @telethon_client.on(events.NewMessage(outgoing=True))
+    async def on_quick_send_command(event):
+        raw_text = (event.raw_text or "").strip()
+        if not event.is_private or not (raw_text == "ارسال" or raw_text.startswith("ارسال ")):
             return
 
         if _me_cache["id"] is None:
             me = await telethon_client.get_me()
             _me_cache["id"] = me.id
-        if event.sender_id == _me_cache["id"]:
+
+        chat = await event.get_chat()
+        target_id = getattr(chat, "id", None)
+        if not target_id or target_id == _me_cache["id"]:
             return
 
-        text = (event.raw_text or "").strip()
-        if not text:
+        requested_emoji = raw_text[len("ارسال"):].strip()
+        gift = None
+
+        if requested_emoji:
+            # أولاً: إذا المستخدم أرسل Custom Emoji، نطابق document_id مباشرة
+            # مع custum_gift_icon الموجود في gifts.json.
+            for entity in (getattr(event.message, "entities", None) or []):
+                document_id = getattr(entity, "document_id", None)
+                if document_id:
+                    gift = find_gift_by_custom_emoji_id(document_id)
+                    if gift is not None:
+                        break
+
+            # ثانياً: الإيموجي النصي العادي المحفوظ في حقل emoji.
+            if gift is None:
+                gift = find_gift_by_emoji(requested_emoji)
+        else:
+            gift = get_quick_send_gift()
+
+        try:
+            await event.delete()
+        except Exception:
+            logger.exception("تعذّر حذف رسالة أمر ارسال")
+
+        if gift is None:
+            if requested_emoji:
+                available = " ".join(
+                    str(item.get("emoji"))
+                    for item in GIFTS
+                    if item.get("emoji")
+                ) or "لا توجد إيموجيات نصية مسجلة حالياً"
+                await telethon_client.send_message(
+                    "me",
+                    f"❌ ما لقيت هدية مطابقة للإيموجي: {requested_emoji}\n"
+                    f"المتاح: {available}",
+                )
+            else:
+                await telethon_client.send_message(
+                    "me",
+                    "❌ ما محدد هدية تلقائية. افتح البوت > إدارة الهدايا > هدية تلقائية وحدد واحدة.",
+                )
             return
 
-        if "\n" in text or " " in text:
-            return
-
-        coupon = coupon_system.get_coupon(text)
-        if coupon is None:
-            # ليست قسيمة معروفة -> تجاهل الرسالة بصمت دون أي رد
-            return
-
-        sender_id = event.sender_id
-
-        if not coupon_system.is_active(coupon):
-            await event.reply("⛔️ هذه القسيمة منتهية الصلاحية أو استُهلكت بالكامل.")
-            return
-        if sender_id in coupon["used_by"]:
-            await event.reply("⚠️ لقد استخدمت هذه القسيمة من قبل.")
-            return
-
-        gift = find_gift(coupon["gift_id"])
-        if not gift:
-            await event.reply("❌ حدثت مشكلة، الهدية المرتبطة بالقسيمة لم تعد متوفرة.")
-            return
-
-        recipient = await backend_system.resolve_user(telethon_client, sender_id)
+        recipient = await backend_system.resolve_user(telethon_client, target_id)
         if recipient is None:
-            await event.reply("❌ تعذّر إتمام العملية.")
+            await telethon_client.send_message(
+                "me",
+                f"❌ تعذّر تنفيذ أمر «ارسال»: لم أستطع تحديد مستلم المحادثة ({target_id}).",
+            )
             return
-
-        redeemed = coupon_system.redeem(text, sender_id)
-        if redeemed is None:
-            # حالة نادرة: انتهت القسيمة بين لحظة التحقق ولحظة الاستهلاك
-            await event.reply("⛔️ هذه القسيمة لم تعد صالحة.")
-            return
-
-        text_with_entities = None
-        if coupon.get("comment_text"):
-            text_with_entities = backend_system.build_text_with_entities(coupon["comment_text"], [])
 
         result = await backend_system.send_gift(
             telethon_client,
             recipient,
             int(gift["gift_id"]),
-            hide_name=coupon.get("hide_name", False),
-            text_with_entities=text_with_entities,
+            hide_name=False,
+            text_with_entities=None,
         )
 
-        if result.success:
-            await event.reply("🎉 تم استلام الهدية عبر القسيمة بنجاح!")
-        else:
-            await event.reply("❌ فشل إرسال الهدية: " + _error_message(result.error_code))
+        if not result.success:
+            await telethon_client.send_message(
+                "me",
+                "❌ فشل أمر «ارسال» إلى "
+                f"{getattr(chat, 'username', None) or target_id}: "
+                + _error_message(result.error_code),
+            )
+

@@ -45,20 +45,15 @@ def load_dotenv_if_present(path: str = ".env") -> None:
 
 
 def ensure_gifts_file(volume_path: str) -> None:
-    """يضمن أن ملف الهدايا المستخدم من قبل البوت يحتوي على أحدث نسخة من
-    gifts.json المحلي. إذا كان الملف الهدف غير موجود، يُنشأ من الملف المحلي.
-    وإذا كان الملف المحلي أحدث من الهدف، يتم مزامنته أيضاً."""
+    """ينشئ ملف الهدايا من النسخة الافتراضية عند أول تشغيل فقط.
+
+    إذا كان الملف موجوداً مسبقاً فلا تتم الكتابة فوقه، لأن إدارة الهدايا
+    والهدية التلقائية تُحفظ داخله ويجب أن تبقى بعد إعادة التشغيل/النشر.
+    """
     default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gifts.json")
 
     if os.path.exists(volume_path):
-        if os.path.exists(default_path):
-            try:
-                if os.path.getmtime(default_path) > os.path.getmtime(volume_path):
-                    shutil.copy(default_path, volume_path)
-                    logger.info("تمت مزامنة ملف الهدايا المحلي إلى: %s", volume_path)
-            except OSError:
-                pass
-        logger.info("gift.json موجود مسبقاً في الفوليوم: %s", volume_path)
+        logger.info("gifts.json موجود مسبقاً: %s", volume_path)
         return
 
     os.makedirs(os.path.dirname(volume_path) or ".", exist_ok=True)
@@ -72,18 +67,30 @@ async def main() -> None:
     bot_token = os.environ["BOT_TOKEN"]
     api_id = int(os.environ["API_ID"])
     api_hash = os.environ["API_HASH"]
-    owner_id = int(os.environ["OWNER_ID"])
+    owner_ids_raw = os.environ.get("OWNER_IDS") or os.environ.get("OWNER_ID")
+    if not owner_ids_raw:
+        raise RuntimeError("يجب تحديد OWNER_IDS (أو OWNER_ID للتوافق القديم).")
+    try:
+        owner_ids = {
+            int(value.strip())
+            for value in owner_ids_raw.split(",")
+            if value.strip()
+        }
+    except ValueError as exc:
+        raise RuntimeError("OWNER_IDS يجب أن يحتوي أرقام Telegram مفصولة بفواصل.") from exc
+    if not owner_ids:
+        raise RuntimeError("OWNER_IDS لا يحتوي أي معرف صالح.")
+
     session_string = os.environ["SESSION_STRING"]
     default_gifts_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gifts.json")
-    gifts_volume_path = os.environ.get("GIFTS_VOLUME_PATH", default_gifts_path)
-    coupons_volume_path = os.environ.get("COUPONS_VOLUME_PATH", "coupons.json")
+    gifts_volume_path = os.environ.get("GIFTS_VOLUME_PATH") or default_gifts_path
 
     ensure_gifts_file(gifts_volume_path)
 
     telethon_client = TelegramClient(StringSession(session_string), api_id, api_hash)
     bot = AsyncTeleBot(bot_token)
 
-    front_system.setup(bot, telethon_client, gifts_volume_path, owner_id, coupons_volume_path)
+    front_system.setup(bot, telethon_client, gifts_volume_path, owner_ids)
 
     async with telethon_client:
         me = await telethon_client.get_me()
