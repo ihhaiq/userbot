@@ -150,43 +150,137 @@ def _slice_utf16(text: str, offset: int, length: int) -> str:
         return ""
 
 
-def _extract_single_custom_emoji(message) -> tuple[Optional[str], Optional[str]]:
-    """يرجع (custom_emoji_id, fallback_emoji_text) إذا الرسالة تحتوي Custom Emoji واحد فقط."""
+def _utf16_len(text: str) -> int:
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _message_text_and_entities(message):
+    """يدعم الرسائل النصية والكابتشن، ويعيد النص مع الـentities المقابلة له."""
+    text = getattr(message, "text", None)
+    if text is not None:
+        return text, (getattr(message, "entities", None) or [])
+
+    caption = getattr(message, "caption", None)
+    if caption is not None:
+        return caption, (getattr(message, "caption_entities", None) or [])
+
+    return "", []
+
+
+def _custom_emoji_entities(message) -> list[dict]:
+    """يجمع كل Custom Emoji مع موقعه الحقيقي داخل النص بوحدات UTF-16."""
+    text, entities = _message_text_and_entities(message)
     found = []
-    text = getattr(message, "text", None) or ""
-    for entity in (getattr(message, "entities", None) or []):
+    for entity in entities:
         if getattr(entity, "type", None) != "custom_emoji":
             continue
         custom_id = getattr(entity, "custom_emoji_id", None)
         if not custom_id:
             continue
-        fallback = _slice_utf16(text, entity.offset, entity.length)
-        found.append((str(custom_id), fallback))
+        offset = int(getattr(entity, "offset", 0) or 0)
+        length = int(getattr(entity, "length", 0) or 0)
+        found.append({
+            "custom_emoji_id": str(custom_id),
+            "emoji": _slice_utf16(text, offset, length) or "🎁",
+            "start": offset,
+            "end": offset + length,
+        })
+    return found
 
-    if len(found) != 1:
+
+def _line_records(text: str) -> list[tuple[str, int, int]]:
+    """يرجع الأسطر غير الفارغة مع بداية/نهاية كل سطر بوحدات UTF-16."""
+    records = []
+    cursor = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        line_len = _utf16_len(line)
+        if line.strip():
+            records.append((line, cursor, cursor + line_len))
+        cursor += _utf16_len(raw_line)
+
+    # splitlines() يرجع [] للنص بدون سطر جديد في بعض الحالات الخاصة
+    if not records and text.strip():
+        records.append((text, 0, _utf16_len(text)))
+    return records
+
+
+def _pick_gift_custom_emoji(
+    line_text: str,
+    line_start: int,
+    line_end: int,
+    custom_entities: list[dict],
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    يختار Custom Emoji الخاص بالهدية داخل هذا السطر فقط.
+
+    إذا توجد عدة Custom Emoji نتجاهل الباقي ونفضّل الإيموجي الأقرب قبل السعر،
+    ثم الأقرب قبل gift_id، ثم أول Custom Emoji في السطر كـfallback.
+    """
+    candidates = [
+        item for item in custom_entities
+        if item["start"] < line_end and item["end"] > line_start
+    ]
+    if not candidates:
         return None, None
-    return found[0]
+
+    candidates.sort(key=lambda item: item["start"])
+
+    # أفضل مرساة هي بداية رقم السعر نفسه، وليس رمز النجمة؛ لأن النجمة قد تكون
+    # Custom Emoji أيضاً. نبحث عن أول رقم قصير، ثم نأخذ أقرب Custom Emoji قبله.
+    price_number_anchor = None
+    for match in re.finditer(r"\d+", line_text):
+        try:
+            value = int(match.group(0))
+        except ValueError:
+            continue
+        if value < 10**9:
+            price_number_anchor = match
+            break
+
+    id_anchor = re.search(r"\d{10,}", line_text)
+
+    boundary = None
+    if price_number_anchor:
+        boundary = line_start + _utf16_len(line_text[:price_number_anchor.start()])
+    elif id_anchor:
+        boundary = line_start + _utf16_len(line_text[:id_anchor.start()])
+
+    if boundary is not None:
+        before = [item for item in candidates if item["start"] < boundary]
+        if before:
+            # الأقرب مباشرة للسعر/المعرف هو غالباً إيموجي الهدية، أما الزخارف السابقة فتُتجاهل.
+            chosen = max(before, key=lambda item: item["start"])
+            return chosen["custom_emoji_id"], chosen["emoji"]
+
+    chosen = candidates[0]
+    return chosen["custom_emoji_id"], chosen["emoji"]
 
 
-def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
-    """
-    يقبل رسالة واحدة فيها gift_id + Custom Emoji + السعر.
-
-    الصيغة المفضلة:
-        <custom emoji> 50⭐️— 5974210632977745012
-
-    ويقبل أيضاً الصيغ المرنة القديمة.
-    """
-    text = (getattr(message, "text", None) or "").strip()
+def _parse_gift_record(
+    line_text: str,
+    line_start: int,
+    line_end: int,
+    custom_entities: list[dict],
+) -> tuple[Optional[dict], Optional[str]]:
+    """يحلل سطر هدية واحد ويأخذ فقط Custom Emoji المرتبط بهذا السطر."""
+    text = line_text.strip()
     if not text:
-        return None, "❌ أرسل البيانات كنص يحتوي الآيدي والإيموجي البريميوم والسعر."
+        return None, None
 
-    custom_emoji_id, emoji_text = _extract_single_custom_emoji(message)
+    # تجاهل الأسطر التي لا تبدو كسطر هدية أصلاً، مهم عند تحويل رسائل تحتوي شرحاً إضافياً.
+    if not re.search(r"\d{10,}", text):
+        return None, None
+
+    custom_emoji_id, emoji_text = _pick_gift_custom_emoji(
+        line_text,
+        line_start,
+        line_end,
+        custom_entities,
+    )
     if not custom_emoji_id:
-        return None, "❌ الرسالة لازم تحتوي إيموجي بريميوم (Custom Emoji) واحد بالضبط."
+        return None, "❌ ما لقيت Premium / Custom Emoji خاص بالهدية في هذا السطر."
 
-    # الصيغة الأساسية: <emoji> 50⭐️— `5974210632977745012`
-    # Markdown مثل **...** و `...` يصل للنص كأرقام عادية مع Entities منفصلة.
     exact_price_match = re.search(r"(\d+)\s*⭐(?:️)?", text)
     exact_id_match = re.search(r"(?:—|–|-)\s*`?\s*(\d{10,})\s*`?\s*$", text)
 
@@ -204,7 +298,6 @@ def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
     gift_id = int(exact_id_match.group(1)) if exact_id_match else (int(id_match.group(1)) if id_match else None)
     price = int(exact_price_match.group(1)) if exact_price_match else (int(price_match.group(1)) if price_match else None)
 
-    # صيغة مختصرة بدون عناوين: أول رقم طويل = gift_id وآخر رقم آخر = السعر.
     numbers = [int(value) for value in re.findall(r"\d+", text)]
     if gift_id is None:
         gift_id = next((value for value in numbers if value >= 10**9), None)
@@ -215,9 +308,9 @@ def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
             price = remaining[-1]
 
     if gift_id is None:
-        return None, "❌ ما قدرت أحدد gift_id. أرسله كرقم طويل داخل الرسالة."
+        return None, "❌ ما قدرت أحدد gift_id في هذا السطر."
     if price is None or price <= 0:
-        return None, "❌ ما قدرت أحدد السعر. لازم يكون رقماً أكبر من صفر."
+        return None, "❌ ما قدرت أحدد السعر في هذا السطر."
 
     return {
         "gift_id": str(gift_id),
@@ -226,6 +319,60 @@ def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
         "price": price,
     }, None
 
+
+def parse_gift_inputs(message) -> tuple[list[dict], list[str]]:
+    """
+    يقبل هدية واحدة أو عدة هدايا في الرسالة نفسها.
+
+    كل سطر يحتوي gift_id طويل يُعامل كهدية مستقلة، وأي Custom Emoji إضافي
+    خارج السطر أو أبعد عن السعر يتم تجاهله تلقائياً.
+    """
+    text, _ = _message_text_and_entities(message)
+    text = text or ""
+    if not text.strip():
+        return [], ["❌ أرسل البيانات كنص يحتوي الآيدي والإيموجي البريميوم والسعر."]
+
+    custom_entities = _custom_emoji_entities(message)
+    gifts = []
+    errors = []
+
+    for line_text, line_start, line_end in _line_records(text):
+        gift_data, error = _parse_gift_record(
+            line_text,
+            line_start,
+            line_end,
+            custom_entities,
+        )
+        if gift_data:
+            gifts.append(gift_data)
+        elif error:
+            errors.append(error)
+
+    # توافق مع الرسائل القديمة ذات السطر الواحد أو النص غير المقسّم بشكل واضح.
+    if not gifts and not errors and re.search(r"\d{10,}", text):
+        gift_data, error = _parse_gift_record(
+            text,
+            0,
+            _utf16_len(text),
+            custom_entities,
+        )
+        if gift_data:
+            gifts.append(gift_data)
+        elif error:
+            errors.append(error)
+
+    if not gifts and not errors:
+        errors.append("❌ ما لقيت سطر هدية صالح. كل هدية لازم تحتوي gift_id طويل.")
+
+    return gifts, errors
+
+
+def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
+    """توافق خلفي: يعيد أول هدية فقط لمن يستدعي الدالة القديمة."""
+    gifts, errors = parse_gift_inputs(message)
+    if gifts:
+        return gifts[0], None
+    return None, (errors[0] if errors else "❌ تعذر قراءة الهدية.")
 
 def upsert_gift(gift_data: dict) -> str:
     """يضيف هدية جديدة أو يحدث نفس gift_id إذا كان موجوداً، ويرجع added/updated."""
@@ -421,6 +568,8 @@ def format_add_gifts_prompt(added: int = 0, updated: int = 0, last_notice: Optio
         "• 50 هو السعر بالنجوم",
         "• الرقم الأخير هو gift_id",
         "• نفس gift_id يُحدَّث بدل ما يتكرر",
+        "• تقدر ترسل عدة هدايا برسالة وحدة: كل هدية بسطر مستقل",
+        "• أي Custom Emoji إضافي بالسطر يتم تجاهله؛ البوت يأخذ إيموجي الهدية الأقرب للسعر",
         "",
         f"تمت معالجة: {processed} هدية",
         f"• مضافة: {added}",
@@ -1152,15 +1301,16 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     async def handle_add_gift_data(message):
         user_id = message.from_user.id
         session = SESSIONS[user_id]
-        gift_data, error = parse_gift_input(message)
+        gift_items, errors = parse_gift_inputs(message)
 
-        if error:
+        if not gift_items:
+            error_text = errors[0] if errors else "❌ ما لقيت هدية صالحة في الرسالة."
             try:
                 await bot.edit_message_text(
                     format_add_gifts_prompt(
                         int(session.get("added_count", 0)),
                         int(session.get("updated_count", 0)),
-                        last_notice=error + " جرّب الرسالة التالية.",
+                        last_notice=error_text + " جرّب الرسالة التالية.",
                     ),
                     chat_id=message.chat.id,
                     message_id=session["message_id"],
@@ -1169,28 +1319,42 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             except Exception:
                 await bot.reply_to(
                     message,
-                    error + "\n\nمثال: 🧸 50⭐️— `5974210632977745012`",
+                    error_text + "\n\nمثال: 🧸 50⭐️— `5974210632977745012`",
                 )
             return
 
-        action = upsert_gift(gift_data)
-        if action == "added":
-            session["added_count"] = int(session.get("added_count", 0)) + 1
-            verb = "إضافة"
-        else:
-            session["updated_count"] = int(session.get("updated_count", 0)) + 1
-            verb = "تحديث"
+        added_now = 0
+        updated_now = 0
+        for gift_data in gift_items:
+            action = upsert_gift(gift_data)
+            if action == "added":
+                session["added_count"] = int(session.get("added_count", 0)) + 1
+                added_now += 1
+            else:
+                session["updated_count"] = int(session.get("updated_count", 0)) + 1
+                updated_now += 1
 
         try:
             await bot.delete_message(message.chat.id, message.message_id)
         except Exception:
             pass
 
+        parts = []
+        if added_now:
+            parts.append(f"مضافة {added_now}")
+        if updated_now:
+            parts.append(f"محدثة {updated_now}")
+        notice = f"✅ تمت معالجة {len(gift_items)} هدية"
+        if parts:
+            notice += " (" + "، ".join(parts) + ")"
+        if errors:
+            notice += f" — تم تجاهل {len(errors)} سطر غير صالح"
+
         await bot.edit_message_text(
             format_add_gifts_prompt(
                 int(session.get("added_count", 0)),
                 int(session.get("updated_count", 0)),
-                last_notice=f"✅ تم {verb} الهدية — {gift_data['price']}⭐",
+                last_notice=notice,
             ),
             chat_id=message.chat.id,
             message_id=session["message_id"],
