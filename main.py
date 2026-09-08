@@ -87,17 +87,35 @@ async def main() -> None:
 
     ensure_gifts_file(gifts_volume_path)
 
-    telethon_client = TelegramClient(StringSession(session_string), api_id, api_hash)
+    telethon_client = TelegramClient(
+        StringSession(session_string),
+        api_id,
+        api_hash,
+        request_retries=5,
+        connection_retries=10,
+        retry_delay=2,
+        auto_reconnect=True,
+        flood_sleep_threshold=60,
+    )
     bot = AsyncTeleBot(bot_token)
 
     front_system.setup(bot, telethon_client, gifts_volume_path, owner_ids)
 
-    async with telethon_client:
-        me = await telethon_client.get_me()
-        logger.info("تم الاتصال بالحساب المضيف: %s", getattr(me, "username", me.id))
-        logger.info("بدء تشغيل بوت الواجهة...")
-        # skip_pending=True: يتجاهل أي رسائل/تحديثات وصلت قبل بدء هذا التشغيل
-        await bot.infinity_polling(skip_pending=True)
+    try:
+        async with telethon_client:
+            me = await telethon_client.get_me()
+            logger.info("تم الاتصال بالحساب المضيف: %s", getattr(me, "username", me.id))
+            logger.info("بدء تشغيل بوت الواجهة...")
+            await bot.infinity_polling(
+                skip_pending=True,
+                timeout=30,
+                request_timeout=45,
+                logger_level=logging.ERROR,
+                allowed_updates=["message", "callback_query"],
+            )
+    finally:
+        await front_system.close_resources()
+        await bot.close_session()
 
 
 if __name__ == "__main__":

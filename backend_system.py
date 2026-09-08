@@ -15,7 +15,9 @@ backend_system.py
 عبر GiftResult / GiftErrorCode بدل رسائل خطأ خام.
 """
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Union
@@ -54,6 +56,7 @@ class GiftErrorCode(str, Enum):
     USER_DELETED = "USER_DELETED"
     GIFT_NOT_FOUND = "GIFT_NOT_FOUND"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    PAYMENT_BUSY = "PAYMENT_BUSY"
     UNKNOWN = "UNKNOWN"
 
 
@@ -72,6 +75,13 @@ class StarsBalance:
     nanos: int = 0
 
 
+_BALANCE_CACHE_SECONDS = 3.0
+_BALANCE_STALE_SECONDS = 300.0
+_balance_cache: Optional[tuple[float, StarsBalance]] = None
+_balance_lock: Optional[asyncio.Lock] = None
+_payment_lock: Optional[asyncio.Lock] = None
+
+
 # أجزاء من نصوص أخطاء MTProto الخام التي تدل على نفاد رصيد النجوم
 _INSUFFICIENT_BALANCE_HINTS = ("BALANCE_TOO_LOW", "STARS_BALANCE", "NOT_ENOUGH")
 
@@ -79,20 +89,61 @@ _INSUFFICIENT_BALANCE_HINTS = ("BALANCE_TOO_LOW", "STARS_BALANCE", "NOT_ENOUGH")
 _GIFT_NOT_FOUND_HINTS = ("STARGIFT_INVALID", "GIFT_ID_INVALID", "STARGIFT_USAGE_LIMITED")
 
 
+def _get_balance_lock() -> asyncio.Lock:
+    global _balance_lock
+    if _balance_lock is None:
+        _balance_lock = asyncio.Lock()
+    return _balance_lock
+
+
+def _get_payment_lock() -> asyncio.Lock:
+    global _payment_lock
+    if _payment_lock is None:
+        _payment_lock = asyncio.Lock()
+    return _payment_lock
+
+
+def invalidate_stars_balance_cache() -> None:
+    global _balance_cache
+    _balance_cache = None
+
+
 async def get_stars_balance(client: TelegramClient) -> Optional[StarsBalance]:
-    """يجلب الرصيد المتوفر من حساب اليوزربوت بدون تنفيذ أي عملية دفع."""
-    try:
-        status = await client(GetStarsStatusRequest(peer=InputPeerSelf()))
-        balance = status.balance
-        return StarsBalance(
-            amount=int(getattr(balance, "amount", 0)),
-            nanos=int(getattr(balance, "nanos", 0)),
-        )
-    except RPCError:
-        logger.exception("get_stars_balance: رفض Telegram طلب قراءة الرصيد")
-    except Exception:
-        logger.exception("get_stars_balance: تعذر قراءة رصيد النجوم")
-    return None
+    """يجلب الرصيد مع دمج الطلبات المتزامنة وكاش قصير لتخفيف الضغط."""
+    global _balance_cache
+    now = time.monotonic()
+    if _balance_cache and now - _balance_cache[0] <= _BALANCE_CACHE_SECONDS:
+        return _balance_cache[1]
+
+    async with _get_balance_lock():
+        now = time.monotonic()
+        if _balance_cache and now - _balance_cache[0] <= _BALANCE_CACHE_SECONDS:
+            return _balance_cache[1]
+
+        stale = _balance_cache
+        try:
+            status = await asyncio.wait_for(
+                client(GetStarsStatusRequest(peer=InputPeerSelf())),
+                timeout=20,
+            )
+            raw_balance = status.balance
+            balance = StarsBalance(
+                amount=int(getattr(raw_balance, "amount", 0)),
+                nanos=int(getattr(raw_balance, "nanos", 0)),
+            )
+            _balance_cache = (time.monotonic(), balance)
+            return balance
+        except RPCError as exc:
+            logger.warning("get_stars_balance: رفض Telegram طلب قراءة الرصيد: %s", exc)
+        except TimeoutError:
+            logger.warning("get_stars_balance: انتهت مهلة قراءة رصيد النجوم")
+        except Exception:
+            logger.exception("get_stars_balance: تعذر قراءة رصيد النجوم")
+
+        if stale and time.monotonic() - stale[0] <= _BALANCE_STALE_SECONDS:
+            logger.info("get_stars_balance: استخدام آخر رصيد محفوظ مؤقتاً")
+            return stale[1]
+        return None
 
 
 async def resolve_user(client: TelegramClient, value: Union[str, int]) -> Optional[User]:
@@ -190,6 +241,36 @@ async def send_gift(
         2. تنفيذ الدفع الفعلي عبر SendStarsFormRequest — هنا فقط يتم الخصم
            والإرسال الحقيقي.
     """
+    payment_lock = _get_payment_lock()
+    try:
+        await asyncio.wait_for(payment_lock.acquire(), timeout=15)
+    except TimeoutError:
+        logger.warning("send_gift: رفض الطلب لأن عملية دفع أخرى ما زالت مستمرة")
+        return GiftResult(success=False, error_code=GiftErrorCode.PAYMENT_BUSY)
+
+    try:
+        result = await _send_gift_unlocked(
+            client,
+            recipient,
+            gift_id,
+            hide_name=hide_name,
+            text_with_entities=text_with_entities,
+        )
+        if result.success:
+            invalidate_stars_balance_cache()
+        return result
+    finally:
+        payment_lock.release()
+
+
+async def _send_gift_unlocked(
+    client: TelegramClient,
+    recipient: User,
+    gift_id: int,
+    hide_name: bool = False,
+    text_with_entities: Optional[TextWithEntities] = None,
+) -> GiftResult:
+    """ينفذ دفعة واحدة؛ الاستدعاء الخارجي يتولى منع تداخل المدفوعات."""
     try:
         peer = await client.get_input_entity(recipient)
     except Exception:

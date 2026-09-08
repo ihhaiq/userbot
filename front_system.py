@@ -20,14 +20,17 @@ OWNER_IDS فقط — أي رسالة أو زر من حساب غير موجود �
     confirming       -> عرض ملخّص وانتظار تأكيد/تراجع
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
-
-import aiohttp
+import tempfile
+import time
+from functools import wraps
 from typing import Optional
 
+import aiohttp
 from telebot import types
 from telebot.async_telebot import AsyncTeleBot
 from telethon import events
@@ -41,6 +44,7 @@ logger = logging.getLogger(__name__)
 # حالة كل مستخدم أثناء تدفق اختيار الهدية ("الفقاعة المؤقتة")
 # ---------------------------------------------------------------------------
 SESSIONS: dict = {}
+SESSION_TTL_SECONDS = 30 * 60
 
 STAGE_CHOOSING_GIFT = "choosing_gift"
 STAGE_CHOOSING_TARGET = "choosing_target"
@@ -48,6 +52,7 @@ STAGE_WAITING_TARGET = "waiting_target"
 STAGE_CHOOSING_HIDE = "choosing_hide"
 STAGE_WAITING_COMMENT = "waiting_comment"
 STAGE_CONFIRMING = "confirming"
+STAGE_PROCESSING = "processing"
 
 STAGE_ADD_GIFT_WAITING_DATA = "add_gift_waiting_data"
 
@@ -55,10 +60,39 @@ GIFTS: list = []          # كتالوج الهدايا المحمّل في ال
 GIFTS_PATH: str = ""      # مسار ملف gift.json داخل الفوليوم
 OWNER_IDS: set[int] = set()
 TG_CLIENT = None          # كائن TelegramClient (Telethon) الخاص بالحساب المضيف
+GIFT_FILE_LOCK: Optional[asyncio.Lock] = None
+HTTP_SESSION: Optional[aiohttp.ClientSession] = None
+BOT_API_MAX_ATTEMPTS = 4
 
 
 def clear_session(user_id: int) -> None:
     SESSIONS.pop(user_id, None)
+
+
+def set_session(user_id: int, data: dict) -> dict:
+    data["_updated_at"] = time.monotonic()
+    SESSIONS[user_id] = data
+    return data
+
+
+def get_session(user_id: int) -> Optional[dict]:
+    session = SESSIONS.get(user_id)
+    if session is None:
+        return None
+    if time.monotonic() - session.get("_updated_at", 0) > SESSION_TTL_SECONDS:
+        clear_session(user_id)
+        return None
+    session["_updated_at"] = time.monotonic()
+    return session
+
+
+def session_matches(user_id: int, stage: str, chat_id: Optional[int] = None) -> bool:
+    session = get_session(user_id)
+    return bool(
+        session
+        and session.get("stage") == stage
+        and (chat_id is None or session.get("chat_id") == chat_id)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +112,10 @@ def _resolve_gifts_path(path: str) -> str:
 def load_gifts_from_disk() -> list:
     resolved_path = _resolve_gifts_path(GIFTS_PATH)
     with open(resolved_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        gifts = json.load(f)
+    if not isinstance(gifts, list):
+        raise ValueError("gifts.json يجب أن يحتوي قائمة هدايا")
+    return gifts
 
 
 def reload_gifts() -> int:
@@ -89,43 +126,62 @@ def reload_gifts() -> int:
 
 
 def find_gift(local_id: int) -> Optional[dict]:
-    return next((g for g in GIFTS if g["id"] == local_id), None)
+    return next((g for g in GIFTS if g.get("id") == local_id), None)
 
 
-def remove_gift_by_id(gift_id: int) -> bool:
+def _gift_file_lock() -> asyncio.Lock:
+    global GIFT_FILE_LOCK
+    if GIFT_FILE_LOCK is None:
+        GIFT_FILE_LOCK = asyncio.Lock()
+    return GIFT_FILE_LOCK
+
+
+def _write_gifts_atomic(gifts: list) -> None:
+    """يكتب الملف ذرياً كي لا يترك JSON ناقصاً عند انقطاع العملية."""
     resolved_path = _resolve_gifts_path(GIFTS_PATH)
+    directory = os.path.dirname(resolved_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".gifts-", suffix=".tmp", dir=directory)
     try:
-        with open(resolved_path, "r", encoding="utf-8") as f:
-            gifts = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        gifts = []
-
-    original_len = len(gifts)
-    gifts = [
-        g
-        for g in gifts
-        if not (
-            g.get("id") == gift_id
-            or g.get("gift_id") == gift_id
-            or g.get("gift_id") == str(gift_id)
-        )
-    ]
-
-    if len(gifts) == original_len:
-        return False
-
-    with open(resolved_path, "w", encoding="utf-8") as f:
-        json.dump(gifts, f, ensure_ascii=False, indent=2)
-
-    reload_gifts()
-    return True
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(gifts, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, resolved_path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
-def _save_gifts(gifts: list) -> None:
-    resolved_path = _resolve_gifts_path(GIFTS_PATH)
-    with open(resolved_path, "w", encoding="utf-8") as f:
-        json.dump(gifts, f, ensure_ascii=False, indent=2)
-    reload_gifts()
+async def reload_gifts_safely() -> int:
+    global GIFTS
+    async with _gift_file_lock():
+        gifts = await asyncio.to_thread(load_gifts_from_disk)
+        GIFTS = gifts
+    logger.info("تم تحميل %d هدية من %s", len(gifts), GIFTS_PATH)
+    return len(gifts)
+
+
+async def remove_gift_by_id(gift_id: int) -> bool:
+    global GIFTS
+    async with _gift_file_lock():
+        gifts = await asyncio.to_thread(load_gifts_from_disk)
+        filtered = [
+            gift
+            for gift in gifts
+            if not (
+                gift.get("id") == gift_id
+                or str(gift.get("gift_id")) == str(gift_id)
+            )
+        ]
+        if len(filtered) == len(gifts):
+            return False
+        await asyncio.to_thread(_write_gifts_atomic, filtered)
+        GIFTS = filtered
+        return True
 
 
 def _next_local_gift_id(gifts: list) -> int:
@@ -367,46 +423,41 @@ def parse_gift_inputs(message) -> tuple[list[dict], list[str]]:
     return gifts, errors
 
 
-def parse_gift_input(message) -> tuple[Optional[dict], Optional[str]]:
-    """توافق خلفي: يعيد أول هدية فقط لمن يستدعي الدالة القديمة."""
-    gifts, errors = parse_gift_inputs(message)
-    if gifts:
-        return gifts[0], None
-    return None, (errors[0] if errors else "❌ تعذر قراءة الهدية.")
+async def upsert_gifts(gift_items: list[dict]) -> tuple[int, int]:
+    """يضيف دفعة هدايا بقفل وكتابة واحدة، ويعيد عددي المضاف والمحدث."""
+    global GIFTS
+    async with _gift_file_lock():
+        gifts = await asyncio.to_thread(load_gifts_from_disk)
+        added = 0
+        updated = 0
 
-def upsert_gift(gift_data: dict) -> str:
-    """يضيف هدية جديدة أو يحدث نفس gift_id إذا كان موجوداً، ويرجع added/updated."""
-    resolved_path = _resolve_gifts_path(GIFTS_PATH)
-    try:
-        with open(resolved_path, "r", encoding="utf-8") as f:
-            gifts = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        gifts = []
+        for gift_data in gift_items:
+            gift_id = str(gift_data["gift_id"])
+            existing = next(
+                (gift for gift in gifts if str(gift.get("gift_id")) == gift_id),
+                None,
+            )
+            if existing is None:
+                gifts.append({
+                    "id": _next_local_gift_id(gifts),
+                    "gift_id": gift_id,
+                    "custum_gift_icon": str(gift_data["custom_emoji_id"]),
+                    "emoji": gift_data.get("emoji") or "🎁",
+                    "prix": int(gift_data["price"]),
+                })
+                added += 1
+                continue
 
-    existing = next(
-        (gift for gift in gifts if str(gift.get("gift_id")) == str(gift_data["gift_id"])),
-        None,
-    )
+            existing["gift_id"] = gift_id
+            existing["custum_gift_icon"] = str(gift_data["custom_emoji_id"])
+            existing.pop("custom_gift_icon", None)
+            existing["emoji"] = gift_data.get("emoji") or existing.get("emoji") or "🎁"
+            existing["prix"] = int(gift_data["price"])
+            updated += 1
 
-    if existing is None:
-        gifts.append({
-            "id": _next_local_gift_id(gifts),
-            "gift_id": str(gift_data["gift_id"]),
-            "custum_gift_icon": str(gift_data["custom_emoji_id"]),
-            "emoji": gift_data.get("emoji") or "🎁",
-            "prix": int(gift_data["price"]),
-        })
-        action = "added"
-    else:
-        existing["gift_id"] = str(gift_data["gift_id"])
-        existing["custum_gift_icon"] = str(gift_data["custom_emoji_id"])
-        existing.pop("custom_gift_icon", None)
-        existing["emoji"] = gift_data.get("emoji") or existing.get("emoji") or "🎁"
-        existing["prix"] = int(gift_data["price"])
-        action = "updated"
-
-    _save_gifts(gifts)
-    return action
+        await asyncio.to_thread(_write_gifts_atomic, gifts)
+        GIFTS = gifts
+        return added, updated
 
 
 def get_auto_gift() -> Optional[dict]:
@@ -414,29 +465,26 @@ def get_auto_gift() -> Optional[dict]:
     return next((gift for gift in GIFTS if gift.get("auto") is True), None)
 
 
-def set_auto_gift(local_id: int) -> bool:
+async def set_auto_gift(local_id: int) -> bool:
     """يحدد هدية واحدة فقط كهدية تلقائية ويحفظ الاختيار داخل gifts.json."""
-    resolved_path = _resolve_gifts_path(GIFTS_PATH)
-    try:
-        with open(resolved_path, "r", encoding="utf-8") as f:
-            gifts = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
+    global GIFTS
+    async with _gift_file_lock():
+        gifts = await asyncio.to_thread(load_gifts_from_disk)
+        found = False
+        for gift in gifts:
+            is_target = gift.get("id") == local_id
+            if is_target:
+                found = True
+                gift["auto"] = True
+            else:
+                gift.pop("auto", None)
 
-    found = False
-    for gift in gifts:
-        is_target = gift.get("id") == local_id
-        if is_target:
-            found = True
-            gift["auto"] = True
-        else:
-            gift.pop("auto", None)
+        if not found:
+            return False
 
-    if not found:
-        return False
-
-    _save_gifts(gifts)
-    return True
+        await asyncio.to_thread(_write_gifts_atomic, gifts)
+        GIFTS = gifts
+        return True
 
 
 def _normalize_emoji(value: str) -> str:
@@ -704,15 +752,50 @@ def build_gift_management_rich_message(notice: Optional[str] = None) -> dict:
 
 
 async def _bot_api_json(bot: AsyncTeleBot, method: str, payload: dict):
-    """استدعاء Bot API مباشر للميزات الأحدث من نسخة pyTelegramBotAPI المثبتة."""
+    """استدعاء Bot API بجلسة مشتركة واحترام Flood Control لطلبات التعديل."""
+    global HTTP_SESSION
+    if HTTP_SESSION is None or HTTP_SESSION.closed:
+        timeout = aiohttp.ClientTimeout(total=35, connect=10, sock_read=30)
+        connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
+        HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
     url = f"https://api.telegram.org/bot{bot.token}/{method}"
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload) as response:
-            data = await response.json(content_type=None)
-    if not data.get("ok"):
+    can_retry_ambiguous_failure = method.startswith("edit")
+
+    for attempt in range(1, BOT_API_MAX_ATTEMPTS + 1):
+        try:
+            async with HTTP_SESSION.post(url, json=payload) as response:
+                data = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if not can_retry_ambiguous_failure or attempt == BOT_API_MAX_ATTEMPTS:
+                raise
+            await asyncio.sleep(min(2 ** (attempt - 1), 8))
+            continue
+
+        if data.get("ok"):
+            return data.get("result")
+
+        retry_after = (data.get("parameters") or {}).get("retry_after")
+        if retry_after is not None and attempt < BOT_API_MAX_ATTEMPTS:
+            delay = max(1, min(int(retry_after), 60))
+            logger.warning("Telegram %s flood control؛ إعادة المحاولة بعد %s ثانية", method, delay)
+            await asyncio.sleep(delay)
+            continue
+
+        if response.status >= 500 and can_retry_ambiguous_failure and attempt < BOT_API_MAX_ATTEMPTS:
+            await asyncio.sleep(min(2 ** (attempt - 1), 8))
+            continue
+
         raise RuntimeError(f"Telegram {method} failed: {data.get('description') or data}")
-    return data.get("result")
+
+    raise RuntimeError(f"Telegram {method} failed after retries")
+
+
+async def close_resources() -> None:
+    global HTTP_SESSION
+    if HTTP_SESSION is not None and not HTTP_SESSION.closed:
+        await HTTP_SESSION.close()
+    HTTP_SESSION = None
 
 
 async def send_start_message(bot: AsyncTeleBot, chat_id: int) -> None:
@@ -758,22 +841,6 @@ async def edit_gift_management_message(
     )
 
 
-async def send_gift_management_message(
-    bot: AsyncTeleBot,
-    chat_id: int,
-    notice: Optional[str] = None,
-) -> None:
-    await _bot_api_json(
-        bot,
-        "sendRichMessage",
-        {
-            "chat_id": chat_id,
-            "rich_message": build_gift_management_rich_message(notice),
-            "reply_markup": build_gift_management_keyboard().to_dict(),
-        },
-    )
-
-
 def build_auto_gift_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup(row_width=2)
     current = get_auto_gift()
@@ -798,11 +865,6 @@ def build_auto_gift_keyboard() -> types.InlineKeyboardMarkup:
         markup.row(*row)
     markup.row(types.InlineKeyboardButton("⬅️ رجوع", callback_data="gifts:auto:back", style="danger"))
     return markup
-
-
-def get_quick_send_gift() -> Optional[dict]:
-    """يرجع الهدية التلقائية المحددة من لوحة إدارة الهدايا."""
-    return get_auto_gift()
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +907,7 @@ def _error_message(code) -> str:
         GiftErrorCode.USER_DELETED: "الحساب محذوف.",
         GiftErrorCode.GIFT_NOT_FOUND: "هذه الهدية لم تعد متوفرة.",
         GiftErrorCode.INSUFFICIENT_BALANCE: "رصيد النجوم في الحساب المُرسِل غير كافٍ.",
+        GiftErrorCode.PAYMENT_BUSY: "توجد عملية إرسال أخرى قيد التنفيذ. حاول بعد لحظات.",
         GiftErrorCode.UNKNOWN: "حدث خطأ غير متوقع، حاول لاحقاً.",
     }
     return mapping.get(code, "حدث خطأ غير متوقع.")
@@ -857,20 +920,50 @@ UNAUTHORIZED_TEXT = "🚫 لست مرخصاً لاستخدام هذا البوت
 
 
 def owner_only_message(func):
+    @wraps(func)
     async def wrapped(message, *args, **kwargs):
         if message.from_user is None or message.from_user.id not in OWNER_IDS:
             await _bot_ref.reply_to(message, UNAUTHORIZED_TEXT)
             return
-        return await func(message, *args, **kwargs)
+        try:
+            return await func(message, *args, **kwargs)
+        except Exception:
+            logger.exception("فشل معالج الرسالة %s", func.__name__)
+            try:
+                await _bot_ref.send_message(
+                    message.chat.id,
+                    "❌ حدث خطأ مؤقت. حاول مرة ثانية بعد قليل.",
+                )
+            except Exception:
+                logger.exception("تعذر إرسال إشعار خطأ معالج الرسالة")
     return wrapped
 
 
 def owner_only_callback(func):
+    @wraps(func)
     async def wrapped(call, *args, **kwargs):
         if call.from_user is None or call.from_user.id not in OWNER_IDS:
             await _bot_ref.answer_callback_query(call.id, UNAUTHORIZED_TEXT, show_alert=True)
             return
-        return await func(call, *args, **kwargs)
+        try:
+            return await func(call, *args, **kwargs)
+        except Exception:
+            logger.exception("فشل معالج الزر %s", func.__name__)
+            try:
+                await _bot_ref.answer_callback_query(
+                    call.id,
+                    "حدث خطأ مؤقت، حاول مجدداً.",
+                    show_alert=True,
+                )
+            except Exception:
+                logger.debug("تعذر الإجابة عن callback بعد الخطأ", exc_info=True)
+                try:
+                    await _bot_ref.send_message(
+                        call.message.chat.id,
+                        "❌ حدث خطأ مؤقت. حاول مرة ثانية بعد قليل.",
+                    )
+                except Exception:
+                    logger.exception("تعذر إرسال إشعار خطأ معالج الزر")
     return wrapped
 
 
@@ -898,6 +991,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @bot.callback_query_handler(func=lambda call: call.data == "balance:refresh")
     @owner_only_callback
     async def cb_refresh_balance(call):
+        await bot.answer_callback_query(call.id, "جارٍ تحديث رصيد النجوم...")
         try:
             await edit_start_message(
                 bot,
@@ -907,13 +1001,12 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
         except Exception as exc:
             if "message is not modified" not in str(exc).lower():
                 raise
-        await bot.answer_callback_query(call.id, "تم تحديث رصيد النجوم")
 
     # --- /rgift (owner only) -------------------------------------------
     @bot.message_handler(commands=["rgift"])
     @owner_only_message
     async def cmd_rgift(message):
-        count = reload_gifts()
+        count = await reload_gifts_safely()
         await bot.send_message(message.chat.id, f"تم تحديث كتالوج الهدايا ({count} هدية).")
 
     # --- هدية @username -------------------------------------------------
@@ -945,28 +1038,31 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             f"اختر الهدية التي تريد إرسالها إلى {raw_target}:",
             reply_markup=build_gifts_keyboard(),
         )
-        SESSIONS[user_id] = {
+        set_session(user_id, {
             "stage": STAGE_CHOOSING_GIFT,
             "message_id": sent.message_id,
             "target_mode": "other",
             "target_value": resolved.id,
             "target_display": raw_target,
             "target_locked": True,
-        }
+        })
 
     # --- بدء التدفق ------------------------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "take_gift")
     @owner_only_callback
     async def cb_take_gift(call):
         user_id = call.from_user.id
-        SESSIONS[user_id] = {"stage": STAGE_CHOOSING_GIFT, "message_id": call.message.message_id}
+        set_session(
+            user_id,
+            {"stage": STAGE_CHOOSING_GIFT, "message_id": call.message.message_id},
+        )
+        await bot.answer_callback_query(call.id)
         await bot.edit_message_text(
             "اختر الهدية:",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=build_gifts_keyboard(),
         )
-        await bot.answer_callback_query(call.id)
 
     # --- زر عنوان "هل تريد إخفاء اسمك؟" (بدون تأثير) ---------------------
     @bot.callback_query_handler(func=lambda call: call.data == "noop")
@@ -979,7 +1075,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @owner_only_callback
     async def cb_choose_gift(call):
         user_id = call.from_user.id
-        session = SESSIONS.get(user_id)
+        session = get_session(user_id)
         if not session or session["stage"] != STAGE_CHOOSING_GIFT:
             await bot.answer_callback_query(call.id)
             return
@@ -991,6 +1087,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             return
 
         session["gift"] = gift
+        await bot.answer_callback_query(call.id)
         if session.get("target_locked"):
             session["stage"] = STAGE_CHOOSING_HIDE
             await bot.edit_message_text(
@@ -1007,18 +1104,18 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
                 message_id=call.message.message_id,
                 reply_markup=build_target_keyboard(),
             )
-        await bot.answer_callback_query(call.id)
 
     # --- اختيار المستلم: لنفسي / لغيري -------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data in ("target:self", "target:other"))
     @owner_only_callback
     async def cb_choose_target(call):
         user_id = call.from_user.id
-        session = SESSIONS.get(user_id)
+        session = get_session(user_id)
         if not session or session["stage"] != STAGE_CHOOSING_TARGET:
             await bot.answer_callback_query(call.id)
             return
 
+        await bot.answer_callback_query(call.id)
         if call.data == "target:self":
             session["target_mode"] = "self"
             session["target_value"] = user_id
@@ -1038,17 +1135,18 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
             )
-        await bot.answer_callback_query(call.id)
 
     # --- استقبال id/username المستلم (فقط عند "لغيري") ----------------------
     @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_WAITING_TARGET,
+        func=lambda message: session_matches(message.from_user.id, STAGE_WAITING_TARGET),
         content_types=["text"],
     )
     @owner_only_message
     async def handle_target_input(message):
         user_id = message.from_user.id
-        session = SESSIONS[user_id]
+        session = get_session(user_id)
+        if session is None:
+            return
         old_message_id = session.get("message_id")
 
         try:
@@ -1089,40 +1187,42 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @owner_only_callback
     async def cb_hide_name(call):
         user_id = call.from_user.id
-        session = SESSIONS.get(user_id)
+        session = get_session(user_id)
         if not session or session["stage"] != STAGE_CHOOSING_HIDE:
             await bot.answer_callback_query(call.id)
             return
 
         session["hide_name"] = call.data == "hide:yes"
         session["stage"] = STAGE_WAITING_COMMENT
+        await bot.answer_callback_query(call.id)
         await bot.edit_message_text(
             "أرسل تعليقاً الآن ليُرفق مع الهدية، أو اضغط الزر أدناه للإرسال بدون تعليق.",
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=build_comment_keyboard(),
         )
-        await bot.answer_callback_query(call.id)
 
     # --- إرسال بدون تعليق ------------------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "nocomment")
     @owner_only_callback
     async def cb_no_comment(call):
+        await bot.answer_callback_query(call.id)
         await _proceed_to_confirm(
             call.from_user.id, call.message.chat.id, call.message.message_id,
             comment_text=None, comment_entities=None,
         )
-        await bot.answer_callback_query(call.id)
 
     # --- استقبال تعليق نصي -------------------------------------------------
     @bot.message_handler(
-        func=lambda message: SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_WAITING_COMMENT,
+        func=lambda message: session_matches(message.from_user.id, STAGE_WAITING_COMMENT),
         content_types=["text"],
     )
     @owner_only_message
     async def handle_comment(message):
         user_id = message.from_user.id
-        session = SESSIONS[user_id]
+        session = get_session(user_id)
+        if session is None:
+            return
         old_message_id = session.get("message_id")
 
         try:
@@ -1141,7 +1241,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
         )
 
     async def _proceed_to_confirm(user_id, chat_id, message_id, comment_text, comment_entities):
-        session = SESSIONS.get(user_id)
+        session = get_session(user_id)
         if not session:
             return
         session["comment_text"] = comment_text
@@ -1162,6 +1262,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @owner_only_callback
     async def cb_cancel(call):
         user_id = call.from_user.id
+        await bot.answer_callback_query(call.id)
         try:
             await bot.delete_message(call.message.chat.id, call.message.message_id)
         except Exception:
@@ -1173,18 +1274,19 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             "تم إلغاء العملية. اضغط الزر أدناه للبدء من جديد.",
             reply_markup=build_start_keyboard(),
         )
-        await bot.answer_callback_query(call.id)
 
     # --- تأكيد وتنفيذ العملية الفعلية ---------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "confirm")
     @owner_only_callback
     async def cb_confirm(call):
         user_id = call.from_user.id
-        session = SESSIONS.get(user_id)
+        session = get_session(user_id)
         if not session or session["stage"] != STAGE_CONFIRMING:
             await bot.answer_callback_query(call.id)
             return
 
+        # تغيير الحالة قبل أول await يمنع ضغط زر التأكيد مرتين من إرسال هديتين.
+        session["stage"] = STAGE_PROCESSING
         await bot.answer_callback_query(call.id, "جارٍ التنفيذ...")
 
         recipient = await backend_system.resolve_user(TG_CLIENT, session["target_value"])
@@ -1219,12 +1321,12 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
         else:
             final_text = "❌ فشلت العملية.\nالسبب: " + _error_message(result.error_code)
 
+        clear_session(user_id)
         await bot.edit_message_text(
             final_text,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
         )
-        clear_session(user_id)
 
     # =====================================================================
     # إدارة كتالوج الهدايا
@@ -1233,23 +1335,23 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @owner_only_callback
     async def cb_gifts_menu(call):
         clear_session(call.from_user.id)
+        await bot.answer_callback_query(call.id)
         await edit_gift_management_message(
             bot,
             call.message.chat.id,
             call.message.message_id,
         )
-        await bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "gifts:back")
     @owner_only_callback
     async def cb_gifts_back(call):
         clear_session(call.from_user.id)
+        await bot.answer_callback_query(call.id)
         await edit_start_message(
             bot,
             call.message.chat.id,
             call.message.message_id,
         )
-        await bot.answer_callback_query(call.id)
 
     # --- تحديد الهدية التلقائية ---------------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "gifts:auto")
@@ -1276,8 +1378,12 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             return
 
         gift = find_gift(local_id)
-        if gift is None or not set_auto_gift(local_id):
+        if gift is None:
             await bot.answer_callback_query(call.id, "لم يتم العثور على الهدية.", show_alert=True)
+            return
+
+        await bot.answer_callback_query(call.id, "جارٍ حفظ الاختيار...")
+        if not await set_auto_gift(local_id):
             return
 
         gift = find_gift(local_id) or gift
@@ -1287,43 +1393,42 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             message_id=call.message.message_id,
             reply_markup=build_auto_gift_keyboard(),
         )
-        await bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "gifts:auto:back")
     @owner_only_callback
     async def cb_gifts_auto_back(call):
+        await bot.answer_callback_query(call.id)
         await edit_gift_management_message(
             bot,
             call.message.chat.id,
             call.message.message_id,
         )
-        await bot.answer_callback_query(call.id)
 
     # --- إضافة/إزالة هدية ---------------------------------------------------
     @bot.callback_query_handler(func=lambda call: call.data == "gifts:add")
     @owner_only_callback
     async def cb_gifts_add(call):
         user_id = call.from_user.id
-        SESSIONS[user_id] = {
+        set_session(user_id, {
             "stage": STAGE_ADD_GIFT_WAITING_DATA,
             "message_id": call.message.message_id,
             "chat_id": call.message.chat.id,
             "added_count": 0,
             "updated_count": 0,
-        }
+        })
+        await bot.answer_callback_query(call.id)
         await bot.edit_message_text(
             format_add_gifts_prompt(),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=build_add_gifts_keyboard(),
         )
-        await bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "gifts:add:finish")
     @owner_only_callback
     async def cb_gifts_add_finish(call):
         user_id = call.from_user.id
-        session = SESSIONS.get(user_id)
+        session = get_session(user_id)
         if not session or session.get("stage") != STAGE_ADD_GIFT_WAITING_DATA:
             await bot.answer_callback_query(call.id, "جلسة الإضافة منتهية بالفعل.")
             return
@@ -1332,13 +1437,13 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
         updated = int(session.get("updated_count", 0))
         clear_session(user_id)
 
+        await bot.answer_callback_query(call.id, "تم إنهاء إضافة الهدايا")
         await edit_gift_management_message(
             bot,
             call.message.chat.id,
             call.message.message_id,
             notice=f"✅ انتهت الإضافة — {added} مضافة، {updated} محدثة.",
         )
-        await bot.answer_callback_query(call.id, "تم إنهاء إضافة الهدايا")
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("gifts:remove:"))
     @owner_only_callback
@@ -1354,8 +1459,8 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             await bot.answer_callback_query(call.id, "هذه الهدية لم تعد موجودة.", show_alert=True)
             return
 
-        if not remove_gift_by_id(local_id):
-            await bot.answer_callback_query(call.id, "تعذر حذف الهدية.", show_alert=True)
+        await bot.answer_callback_query(call.id, "جارٍ حذف الهدية...")
+        if not await remove_gift_by_id(local_id):
             return
 
         await edit_gift_management_message(
@@ -1364,19 +1469,21 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             call.message.message_id,
             notice="✅ تم حذف الهدية.",
         )
-        await bot.answer_callback_query(call.id, "تم حذف الهدية")
 
     @bot.message_handler(
-        func=lambda message: (
-            SESSIONS.get(message.from_user.id, {}).get("stage") == STAGE_ADD_GIFT_WAITING_DATA
-            and SESSIONS.get(message.from_user.id, {}).get("chat_id") == message.chat.id
+        func=lambda message: session_matches(
+            message.from_user.id,
+            STAGE_ADD_GIFT_WAITING_DATA,
+            message.chat.id,
         ),
         content_types=["text"],
     )
     @owner_only_message
     async def handle_add_gift_data(message):
         user_id = message.from_user.id
-        session = SESSIONS[user_id]
+        session = get_session(user_id)
+        if session is None:
+            return
         gift_items, errors = parse_gift_inputs(message)
 
         if not gift_items:
@@ -1399,16 +1506,9 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
                 )
             return
 
-        added_now = 0
-        updated_now = 0
-        for gift_data in gift_items:
-            action = upsert_gift(gift_data)
-            if action == "added":
-                session["added_count"] = int(session.get("added_count", 0)) + 1
-                added_now += 1
-            else:
-                session["updated_count"] = int(session.get("updated_count", 0)) + 1
-                updated_now += 1
+        added_now, updated_now = await upsert_gifts(gift_items)
+        session["added_count"] = int(session.get("added_count", 0)) + added_now
+        session["updated_count"] = int(session.get("updated_count", 0)) + updated_now
 
         try:
             await bot.delete_message(message.chat.id, message.message_id)
@@ -1480,7 +1580,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
             if gift is None:
                 gift = find_gift_by_emoji(requested_emoji)
         else:
-            gift = get_quick_send_gift()
+            gift = get_auto_gift()
 
         try:
             await event.delete()
