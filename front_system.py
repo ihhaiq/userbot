@@ -533,7 +533,6 @@ def build_confirm_keyboard() -> types.InlineKeyboardMarkup:
 def build_start_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("🎁 خذ هدية", callback_data="take_gift", style="primary"))
-    markup.row(types.InlineKeyboardButton("🔄 تحديث الرصيد", callback_data="balance:refresh"))
     markup.row(types.InlineKeyboardButton("⚙️ إدارة الهدايا", callback_data="gifts:menu", style="primary"))
     return markup
 
@@ -547,18 +546,34 @@ def format_stars_balance(balance: backend_system.StarsBalance) -> str:
     return f"{balance.amount:,}.{fraction}"
 
 
-async def build_start_text() -> str:
+async def build_start_rich_message() -> dict:
     balance = await backend_system.get_stars_balance(TG_CLIENT)
     balance_text = (
         format_stars_balance(balance)
         if balance is not None
         else "تعذر جلبه حالياً"
     )
-    return (
-        "أهلاً بك!\n\n"
-        f"⭐ رصيد النجوم المتوفر: {balance_text}\n\n"
-        "اضغط الزر أدناه للحصول على هدية."
-    )
+    return {
+        "blocks": [
+            {"type": "paragraph", "text": "أهلاً بك!"},
+            {
+                "type": "paragraph",
+                "text": [
+                    {
+                        "type": "button",
+                        "button": {
+                            "text": "🔄 تحديث",
+                            "style": "primary",
+                            "callback_data": "balance:refresh",
+                        },
+                    },
+                    f"  {balance_text} ⭐",
+                ],
+            },
+            {"type": "paragraph", "text": "اضغط الزر أدناه للحصول على هدية."},
+        ],
+        "is_rtl": True,
+    }
 
 
 def build_gift_management_keyboard() -> types.InlineKeyboardMarkup:
@@ -698,6 +713,31 @@ async def _bot_api_json(bot: AsyncTeleBot, method: str, payload: dict):
     if not data.get("ok"):
         raise RuntimeError(f"Telegram {method} failed: {data.get('description') or data}")
     return data.get("result")
+
+
+async def send_start_message(bot: AsyncTeleBot, chat_id: int) -> None:
+    await _bot_api_json(
+        bot,
+        "sendRichMessage",
+        {
+            "chat_id": chat_id,
+            "rich_message": await build_start_rich_message(),
+            "reply_markup": build_start_keyboard().to_dict(),
+        },
+    )
+
+
+async def edit_start_message(bot: AsyncTeleBot, chat_id: int, message_id: int) -> None:
+    await _bot_api_json(
+        bot,
+        "editMessageText",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "rich_message": await build_start_rich_message(),
+            "reply_markup": build_start_keyboard().to_dict(),
+        },
+    )
 
 
 async def edit_gift_management_message(
@@ -853,22 +893,16 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @owner_only_message
     async def cmd_start(message):
         clear_session(message.from_user.id)
-        await bot.send_message(
-            message.chat.id,
-            await build_start_text(),
-            reply_markup=build_start_keyboard(),
-        )
+        await send_start_message(bot, message.chat.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "balance:refresh")
     @owner_only_callback
     async def cb_refresh_balance(call):
-        text = await build_start_text()
         try:
-            await bot.edit_message_text(
-                text,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=build_start_keyboard(),
+            await edit_start_message(
+                bot,
+                call.message.chat.id,
+                call.message.message_id,
             )
         except Exception as exc:
             if "message is not modified" not in str(exc).lower():
@@ -1210,11 +1244,10 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     @owner_only_callback
     async def cb_gifts_back(call):
         clear_session(call.from_user.id)
-        await bot.edit_message_text(
-            await build_start_text(),
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=build_start_keyboard(),
+        await edit_start_message(
+            bot,
+            call.message.chat.id,
+            call.message.message_id,
         )
         await bot.answer_callback_query(call.id)
 
