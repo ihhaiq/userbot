@@ -533,8 +533,32 @@ def build_confirm_keyboard() -> types.InlineKeyboardMarkup:
 def build_start_keyboard() -> types.InlineKeyboardMarkup:
     markup = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("🎁 خذ هدية", callback_data="take_gift", style="primary"))
+    markup.row(types.InlineKeyboardButton("🔄 تحديث الرصيد", callback_data="balance:refresh"))
     markup.row(types.InlineKeyboardButton("⚙️ إدارة الهدايا", callback_data="gifts:menu", style="primary"))
     return markup
+
+
+def format_stars_balance(balance: backend_system.StarsBalance) -> str:
+    """ينسق StarsAmount بدون إخفاء الجزء الكسري النادر."""
+    if not balance.nanos:
+        return f"{balance.amount:,}"
+
+    fraction = f"{abs(balance.nanos):09d}".rstrip("0")
+    return f"{balance.amount:,}.{fraction}"
+
+
+async def build_start_text() -> str:
+    balance = await backend_system.get_stars_balance(TG_CLIENT)
+    balance_text = (
+        format_stars_balance(balance)
+        if balance is not None
+        else "تعذر جلبه حالياً"
+    )
+    return (
+        "أهلاً بك!\n\n"
+        f"⭐ رصيد النجوم المتوفر: {balance_text}\n\n"
+        "اضغط الزر أدناه للحصول على هدية."
+    )
 
 
 def build_gift_management_keyboard() -> types.InlineKeyboardMarkup:
@@ -831,9 +855,25 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
         clear_session(message.from_user.id)
         await bot.send_message(
             message.chat.id,
-            "أهلاً بك! اضغط الزر أدناه للحصول على هدية.",
+            await build_start_text(),
             reply_markup=build_start_keyboard(),
         )
+
+    @bot.callback_query_handler(func=lambda call: call.data == "balance:refresh")
+    @owner_only_callback
+    async def cb_refresh_balance(call):
+        text = await build_start_text()
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=build_start_keyboard(),
+            )
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+        await bot.answer_callback_query(call.id, "تم تحديث رصيد النجوم")
 
     # --- /rgift (owner only) -------------------------------------------
     @bot.message_handler(commands=["rgift"])
@@ -1138,7 +1178,10 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
         )
 
         if result.success:
+            remaining = await backend_system.get_stars_balance(TG_CLIENT)
             final_text = "🎉 تم إرسال الهدية بنجاح!"
+            if remaining is not None:
+                final_text += f"\n⭐ الرصيد المتبقي: {format_stars_balance(remaining)}"
         else:
             final_text = "❌ فشلت العملية.\nالسبب: " + _error_message(result.error_code)
 
@@ -1168,7 +1211,7 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
     async def cb_gifts_back(call):
         clear_session(call.from_user.id)
         await bot.edit_message_text(
-            "أهلاً بك! اضغط الزر أدناه للحصول على هدية.",
+            await build_start_text(),
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             reply_markup=build_start_keyboard(),
@@ -1453,4 +1496,3 @@ def setup(bot: AsyncTeleBot, telethon_client, gifts_path: str, owner_ids) -> Non
                 f"{getattr(chat, 'username', None) or target_id}: "
                 + _error_message(result.error_code),
             )
-

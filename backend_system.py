@@ -22,9 +22,14 @@ from typing import Optional, Union
 
 from telethon import TelegramClient
 from telethon.errors import RPCError, UsernameInvalidError, UsernameNotOccupiedError
-from telethon.tl.functions.payments import GetPaymentFormRequest, SendStarsFormRequest
+from telethon.tl.functions.payments import (
+    GetPaymentFormRequest,
+    GetStarsStatusRequest,
+    SendStarsFormRequest,
+)
 from telethon.tl.types import (
     InputInvoiceStarGift,
+    InputPeerSelf,
     TextWithEntities,
     User,
     MessageEntityBold,
@@ -59,11 +64,35 @@ class GiftResult:
     raw_error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class StarsBalance:
+    """رصيد نجوم الحساب كما يعيده Telegram، شاملاً الجزء الكسري إن وجد."""
+
+    amount: int
+    nanos: int = 0
+
+
 # أجزاء من نصوص أخطاء MTProto الخام التي تدل على نفاد رصيد النجوم
 _INSUFFICIENT_BALANCE_HINTS = ("BALANCE_TOO_LOW", "STARS_BALANCE", "NOT_ENOUGH")
 
 # أجزاء من نصوص أخطاء MTProto الخام التي تدل على أن الهدية غير صالحة
 _GIFT_NOT_FOUND_HINTS = ("STARGIFT_INVALID", "GIFT_ID_INVALID", "STARGIFT_USAGE_LIMITED")
+
+
+async def get_stars_balance(client: TelegramClient) -> Optional[StarsBalance]:
+    """يجلب الرصيد المتوفر من حساب اليوزربوت بدون تنفيذ أي عملية دفع."""
+    try:
+        status = await client(GetStarsStatusRequest(peer=InputPeerSelf()))
+        balance = status.balance
+        return StarsBalance(
+            amount=int(getattr(balance, "amount", 0)),
+            nanos=int(getattr(balance, "nanos", 0)),
+        )
+    except RPCError:
+        logger.exception("get_stars_balance: رفض Telegram طلب قراءة الرصيد")
+    except Exception:
+        logger.exception("get_stars_balance: تعذر قراءة رصيد النجوم")
+    return None
 
 
 async def resolve_user(client: TelegramClient, value: Union[str, int]) -> Optional[User]:
