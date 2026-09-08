@@ -100,8 +100,9 @@ async def main() -> None:
     )
     bot = AsyncTeleBot(bot_token)
 
-    front_system.setup(bot, telethon_client, gifts_volume_path, owner_ids)
+    # سجل /pay أولاً حتى يبقى أمراً مستقلاً حتى لو كان المطور داخل جلسة هدية.
     payment_confirmation.setup(bot, telethon_client, owner_ids)
+    front_system.setup(bot, telethon_client, gifts_volume_path, owner_ids)
 
     try:
         async with telethon_client:
