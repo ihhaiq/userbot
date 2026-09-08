@@ -20,6 +20,7 @@ from telethon.sessions import StringSession
 from telebot.async_telebot import AsyncTeleBot
 
 import front_system
+import payment_confirmation
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,6 +101,7 @@ async def main() -> None:
     bot = AsyncTeleBot(bot_token)
 
     front_system.setup(bot, telethon_client, gifts_volume_path, owner_ids)
+    payment_confirmation.setup(bot, telethon_client, owner_ids)
 
     try:
         async with telethon_client:
