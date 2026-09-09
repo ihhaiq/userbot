@@ -4,7 +4,7 @@ backend_system.py
 الواجهة الخلفية: تتعامل مباشرة مع حساب المستخدم (Userbot) عبر Telethon.
 
 مسؤوليتها فقط:
-    1. التحقق من وجود المستلم (resolve_user)
+    1. التحقق من وجود المستلم (resolve_recipient / resolve_user)
     2. تحويل تنسيقات النص/الإيموجي المميز من صيغة Bot API إلى صيغة MTProto
        (build_text_with_entities)
     3. تنفيذ عملية الشراء والإرسال الفعلية من رصيد نجوم الحساب المضيف
@@ -30,6 +30,7 @@ from telethon.tl.functions.payments import (
     SendStarsFormRequest,
 )
 from telethon.tl.types import (
+    Channel,
     InputInvoiceStarGift,
     InputPeerSelf,
     TextWithEntities,
@@ -47,6 +48,8 @@ from telethon.tl.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+GiftRecipient = Union[User, Channel]
 
 
 class GiftErrorCode(str, Enum):
@@ -81,6 +84,12 @@ _balance_cache: Optional[tuple[float, StarsBalance]] = None
 _balance_lock: Optional[asyncio.Lock] = None
 _payment_lock: Optional[asyncio.Lock] = None
 
+# واجهة البوت تحفظ target_value كرقم id فقط. أرقام القنوات المجرّدة لا تحمل
+# نوع الـpeer، لذلك نحتفظ بالقناة التي تم حلّها من @username إلى حين التأكيد.
+# هذا مهم حتى ينجح المسار الحالي من دون تغيير صيغة الجلسات الموجودة.
+_CHANNEL_RECIPIENT_CACHE_MAX = 256
+_channel_recipient_cache: dict[int, Channel] = {}
+
 
 # أجزاء من نصوص أخطاء MTProto الخام التي تدل على نفاد رصيد النجوم
 _INSUFFICIENT_BALANCE_HINTS = ("BALANCE_TOO_LOW", "STARS_BALANCE", "NOT_ENOUGH")
@@ -106,6 +115,16 @@ def _get_payment_lock() -> asyncio.Lock:
 def invalidate_stars_balance_cache() -> None:
     global _balance_cache
     _balance_cache = None
+
+
+def _cache_channel_recipient(channel: Channel) -> None:
+    """يحفظ channel مؤقتاً بالـid الخام لاستعادته عند مرحلة التأكيد."""
+    channel_id = int(channel.id)
+    _channel_recipient_cache[channel_id] = channel
+    _channel_recipient_cache.move_to_end(channel_id) if hasattr(_channel_recipient_cache, "move_to_end") else None
+    while len(_channel_recipient_cache) > _CHANNEL_RECIPIENT_CACHE_MAX:
+        oldest_id = next(iter(_channel_recipient_cache))
+        _channel_recipient_cache.pop(oldest_id, None)
 
 
 async def get_stars_balance(client: TelegramClient) -> Optional[StarsBalance]:
@@ -146,39 +165,63 @@ async def get_stars_balance(client: TelegramClient) -> Optional[StarsBalance]:
         return None
 
 
-async def resolve_user(client: TelegramClient, value: Union[str, int]) -> Optional[User]:
+async def resolve_recipient(
+    client: TelegramClient,
+    value: Union[str, int],
+) -> Optional[GiftRecipient]:
     """
-    يتحقق من وجود المستخدم عبر username أو user_id ويُرجع كائن User إن وُجد.
+    يتحقق من مستلم الهدية عبر username أو id.
 
-    يُرجع None في أي من الحالات التالية:
-        - المستخدم غير موجود أصلاً (username غير مستخدم / id غير صالح)
-        - تعذّر الوصول إليه من جهة الحساب المضيف (access_hash غير متوفر)
-        - الحساب موجود لكنه محذوف (User.deleted == True)
+    المستلم المدعوم هو:
+        - User عادي غير محذوف.
+        - Channel / Supergroup تدعم Telegram استقبال الهدية لها.
+
+    التحقق النهائي من قابلية القناة لاستقبال Star Gifts يتم عند إنشاء
+    InputInvoiceStarGift لدى Telegram، لأن الخاصية تعتمد على إعدادات القناة.
     """
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("@"):
+            value = value[1:]
+        if value.isdigit():
+            value = int(value)
+
     try:
-        if isinstance(value, str):
-            value = value.strip()
-            if value.startswith("@"):
-                value = value[1:]
-            if value.isdigit():
-                value = int(value)
-
         entity = await client.get_entity(value)
-
-        if not isinstance(entity, User):
-            return None
-
-        if getattr(entity, "deleted", False):
-            logger.info("resolve_user: الحساب %s محذوف", value)
-            return None
-
-        return entity
-
     except (ValueError, UsernameInvalidError, UsernameNotOccupiedError):
+        # front_system يخزن Channel.id المجرّد في الجلسة. عند التأكيد قد لا
+        # يستطيع Telethon استنتاج أنه Channel من الرقم وحده، فنستخدم النسخة
+        # التي حُلّت سابقاً من @username.
+        if isinstance(value, int):
+            cached_channel = _channel_recipient_cache.get(value)
+            if cached_channel is not None:
+                return cached_channel
         return None
     except Exception:
-        logger.exception("resolve_user: خطأ غير متوقع أثناء التحقق من %s", value)
+        if isinstance(value, int):
+            cached_channel = _channel_recipient_cache.get(value)
+            if cached_channel is not None:
+                logger.info("resolve_recipient: استخدام قناة محفوظة مؤقتاً للمعرف %s", value)
+                return cached_channel
+        logger.exception("resolve_recipient: خطأ غير متوقع أثناء التحقق من %s", value)
         return None
+
+    if isinstance(entity, User):
+        if getattr(entity, "deleted", False):
+            logger.info("resolve_recipient: الحساب %s محذوف", value)
+            return None
+        return entity
+
+    if isinstance(entity, Channel):
+        _cache_channel_recipient(entity)
+        return entity
+
+    return None
+
+
+async def resolve_user(client: TelegramClient, value: Union[str, int]) -> Optional[GiftRecipient]:
+    """اسم متوافق مع الكود القديم؛ يدعم الآن المستخدم والقناة كمستلم للهدية."""
+    return await resolve_recipient(client, value)
 
 
 def build_text_with_entities(text: str, entities: list) -> TextWithEntities:
@@ -225,14 +268,14 @@ def build_text_with_entities(text: str, entities: list) -> TextWithEntities:
 
 async def send_gift(
     client: TelegramClient,
-    recipient: User,
+    recipient: GiftRecipient,
     gift_id: int,
     hide_name: bool = False,
     text_with_entities: Optional[TextWithEntities] = None,
 ) -> GiftResult:
     """
     ينفّذ عملية شراء وإرسال هدية فعلية من رصيد نجوم الحساب المضيف (Userbot)
-    إلى recipient.
+    إلى مستخدم أو قناة.
 
     الخطوات:
         1. بناء الفاتورة (InputInvoiceStarGift) والتحقق من صلاحيتها عبر
@@ -265,7 +308,7 @@ async def send_gift(
 
 async def _send_gift_unlocked(
     client: TelegramClient,
-    recipient: User,
+    recipient: GiftRecipient,
     gift_id: int,
     hide_name: bool = False,
     text_with_entities: Optional[TextWithEntities] = None,
