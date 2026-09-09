@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import backend_system
 import front_system
@@ -85,6 +86,30 @@ class BalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(balance.amount == 321 for balance in balances))
 
 
+class RecipientResolutionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        backend_system._channel_recipient_cache.clear()
+
+    async def test_channel_username_can_be_reused_by_raw_channel_id(self):
+        class FakeChannel:
+            def __init__(self, channel_id):
+                self.id = channel_id
+
+        class Client:
+            async def get_entity(self, value):
+                if value == "giftchannel":
+                    return FakeChannel(777)
+                raise ValueError("entity type cannot be inferred from raw channel id")
+
+        client = Client()
+        with patch.object(backend_system, "Channel", FakeChannel):
+            first = await backend_system.resolve_user(client, "@giftchannel")
+            self.assertIsInstance(first, FakeChannel)
+
+            confirmed = await backend_system.resolve_user(client, 777)
+            self.assertIs(confirmed, first)
+
+
 class PaymentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         backend_system._payment_lock = None
@@ -121,4 +146,3 @@ class PaymentTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
